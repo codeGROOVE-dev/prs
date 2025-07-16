@@ -318,22 +318,48 @@ func fetchPRsWithRetry(ctx context.Context, token, username string, logger *log.
 }
 
 func fetchPRs(ctx context.Context, token, username string, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, debug bool, org string) ([]PR, error) {
-	// Build the search query
-	query := fmt.Sprintf("involves:%s type:pr state:open", username)
+	query := buildSearchQuery(username, org)
 	
-	// Add org filter if specified
+	resp, err := makeGitHubSearchRequest(ctx, query, token, httpClient, logger)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	prs, err := parseSearchResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+
+	logger.Printf("Found %d PRs (before deduplication)", len(prs))
+	prs = deduplicatePRs(prs)
+	logger.Printf("Found %d PRs (after deduplication)", len(prs))
+
+	if err := enrichPRsParallel(ctx, token, prs, logger, httpClient, turnClient, debug); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil, err
+		}
+		logger.Printf("Failed to enrich PR data: %v", err)
+	}
+
+	return prs, nil
+}
+
+func buildSearchQuery(username, org string) string {
+	query := fmt.Sprintf("involves:%s type:pr state:open", username)
 	if org != "" {
 		query += fmt.Sprintf(" org:%s", org)
 	}
+	return query
+}
 
-	// Properly encode the URL parameters
+func makeGitHubSearchRequest(ctx context.Context, query, token string, httpClient *http.Client, logger *log.Logger) (*http.Response, error) {
 	params := url.Values{}
 	params.Add("q", query)
 	params.Add("per_page", fmt.Sprintf("%d", maxPerPage))
 	params.Add("sort", "updated")
 
 	apiURL := fmt.Sprintf("%s?%s", apiSearchIssuesEndpoint, params.Encode())
-
 	logger.Printf("Making API call to GET %s", apiURL)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
@@ -342,8 +368,8 @@ func fetchPRs(ctx context.Context, token, username string, logger *log.Logger, h
 	}
 
 	req.Header.Set("Authorization", "token "+token)
-	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	req.Header.Set("User-Agent", "github-pr-notifier-cli")
+	req.Header.Set("Accept", acceptHeader)
+	req.Header.Set("User-Agent", userAgentHeader)
 
 	start := time.Now()
 	resp, err := httpClient.Do(req)
@@ -354,19 +380,20 @@ func fetchPRs(ctx context.Context, token, username string, logger *log.Logger, h
 		}
 		return nil, err
 	}
-	defer resp.Body.Close()
+	
 	logger.Printf("Response received after %v, status: %d", time.Since(start), resp.StatusCode)
+	return resp, nil
+}
 
+func parseSearchResponse(resp *http.Response) ([]PR, error) {
 	if resp.StatusCode == http.StatusUnauthorized {
 		return nil, errors.New("invalid GitHub token")
 	}
 	if resp.StatusCode == http.StatusForbidden {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("GitHub API rate limit or access forbidden: %s", body)
+		return nil, handleHTTPError(resp, "GitHub API rate limit or access forbidden")
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("GitHub API error (status %d): %s", resp.StatusCode, body)
+		return nil, handleHTTPError(resp, "GitHub API error")
 	}
 
 	var result SearchResult
@@ -374,100 +401,89 @@ func fetchPRs(ctx context.Context, token, username string, logger *log.Logger, h
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	logger.Printf("Found %d PRs (before deduplication)", len(result.Items))
-	
-	// Deduplicate PRs by URL (in case GitHub returns duplicates)
-	result.Items = deduplicatePRs(result.Items)
-	logger.Printf("Found %d PRs (after deduplication)", len(result.Items))
-
-	// Fetch detailed PR info for each PR to get review status (parallel)
-	enrichStart := time.Now()
-	if err := enrichPRsParallel(ctx, token, result.Items, logger, httpClient, turnClient, debug); err != nil {
-		if errors.Is(err, context.Canceled) {
-			return nil, err
-		}
-		// Continue even if enrichment fails - we'll have basic PR data
-		logger.Printf("Failed to enrich PR data: %v", err)
-	}
-	if debug {
-		logger.Printf("Enriched %d PRs in %v", len(result.Items), time.Since(enrichStart))
-	}
-
 	return result.Items, nil
 }
 
+func handleHTTPError(resp *http.Response, message string) error {
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return fmt.Errorf("%s (status %d): failed to read error response: %w", message, resp.StatusCode, readErr)
+	}
+	return fmt.Errorf("%s (status %d): %s", message, resp.StatusCode, body)
+}
+
 func deduplicatePRs(prs []PR) []PR {
-	seen := make(map[string]int) // URL -> index in result slice
-	var result []PR
+	seen := make(map[string]PR)
 	
 	for _, pr := range prs {
-		if existingIndex, exists := seen[pr.HTMLURL]; exists {
-			// If we've seen this PR before, keep the one with the later updated time
-			if pr.UpdatedAt.After(result[existingIndex].UpdatedAt) {
-				result[existingIndex] = pr
-			}
-		} else {
-			// First time seeing this PR
-			seen[pr.HTMLURL] = len(result)
-			result = append(result, pr)
+		if existing, exists := seen[pr.HTMLURL]; !exists || pr.UpdatedAt.After(existing.UpdatedAt) {
+			seen[pr.HTMLURL] = pr
 		}
+	}
+	
+	result := make([]PR, 0, len(seen))
+	for _, pr := range seen {
+		result = append(result, pr)
 	}
 	
 	return result
 }
 
 func enrichPRsParallel(ctx context.Context, token string, prs []PR, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, debug bool) error {
-	// Create a semaphore to limit concurrent requests
-	semaphore := make(chan struct{}, maxConcurrentRequests)
+	jobs := make(chan *PR, len(prs))
+	errs := make(chan error, len(prs))
 	
-	// Create a wait group to wait for all goroutines to complete
-	var wg sync.WaitGroup
-	
-	// Channel to collect any errors
-	errChan := make(chan error, len(prs))
-	
-	// Launch goroutines for each PR
-	for i := range prs {
-		wg.Add(1)
-		go func(pr *PR) {
-			defer wg.Done()
-			
-			// Acquire semaphore
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-			
-			// Check for cancellation
-			select {
-			case <-ctx.Done():
-				errChan <- ctx.Err()
-				return
-			default:
-			}
-			
-			// Enrich the PR data
-			if err := enrichPRData(ctx, token, pr, logger, httpClient, turnClient, debug); err != nil {
-				if errors.Is(err, context.Canceled) {
-					errChan <- err
-					return
-				}
-				// Log error but don't fail the whole operation
-				logger.Printf("Failed to enrich PR #%d: %v", pr.Number, err)
-			}
-		}(&prs[i])
+	// Start workers
+	workers := maxConcurrentRequests
+	if len(prs) < workers {
+		workers = len(prs)
 	}
 	
-	// Wait for all goroutines to complete
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go enrichWorker(ctx, token, jobs, errs, logger, httpClient, turnClient, debug, &wg)
+	}
+	
+	// Send jobs
+	for i := range prs {
+		jobs <- &prs[i]
+	}
+	close(jobs)
+	
+	// Wait for workers to complete
 	wg.Wait()
-	close(errChan)
+	close(errs)
 	
 	// Check for cancellation errors
-	for err := range errChan {
+	for err := range errs {
 		if errors.Is(err, context.Canceled) {
 			return err
 		}
 	}
 	
 	return nil
+}
+
+func enrichWorker(ctx context.Context, token string, jobs <-chan *PR, errs chan<- error, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, debug bool, wg *sync.WaitGroup) {
+	defer wg.Done()
+	
+	for pr := range jobs {
+		select {
+		case <-ctx.Done():
+			errs <- ctx.Err()
+			return
+		default:
+		}
+		
+		if err := enrichPRData(ctx, token, pr, logger, httpClient, turnClient, debug); err != nil {
+			if errors.Is(err, context.Canceled) {
+				errs <- err
+				return
+			}
+			logger.Printf("Failed to enrich PR #%d: %v", pr.Number, err)
+		}
+	}
 }
 
 func enrichPRData(ctx context.Context, token string, pr *PR, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, debug bool) error {
@@ -580,8 +596,27 @@ func isBlockingOnUser(pr PR, username string) bool {
 }
 
 func displayPRs(prs []PR, username string, blockingOnly bool, debug bool) {
-	// Split PRs into incoming (authored by others) and outgoing (authored by you)
-	var incoming, outgoing []PR
+	incoming, outgoing := categorizePRs(prs, username)
+	blockingCount := countBlockingPRs(incoming, username, debug)
+
+	displayHeader(blockingOnly, blockingCount, len(incoming), len(outgoing))
+	
+	if shouldDisplayIncoming(incoming, blockingOnly, blockingCount) {
+		displayIncomingPRs(incoming, username, blockingOnly)
+	}
+	
+	if shouldDisplayOutgoing(outgoing, blockingOnly) {
+		displayOutgoingPRs(outgoing, username)
+	}
+	
+	if blockingOnly && blockingCount == 0 {
+		fmt.Print("\n")
+		fmt.Println(successStyle.Render("✨ No PRs awaiting your review - you're all caught up!"))
+	}
+	fmt.Print("\n")
+}
+
+func categorizePRs(prs []PR, username string) (incoming, outgoing []PR) {
 	for _, pr := range prs {
 		if pr.User.Login == username {
 			outgoing = append(outgoing, pr)
@@ -589,28 +624,36 @@ func displayPRs(prs []PR, username string, blockingOnly bool, debug bool) {
 			incoming = append(incoming, pr)
 		}
 	}
+	return
+}
 
-	// Count blocking PRs
-	var blockingCount int
-	for _, pr := range incoming {
-		blocking := isBlockingOnUser(pr, username)
-		if blocking {
-			blockingCount++
+func countBlockingPRs(prs []PR, username string, debug bool) int {
+	count := 0
+	for _, pr := range prs {
+		if isBlockingOnUser(pr, username) {
+			count++
 		}
 		if debug {
-			fmt.Fprintf(os.Stderr, "[DEBUG] PR #%d (%s) - blocking: %v\n", pr.Number, pr.Title, blocking)
-			if pr.TurnResponse != nil {
-				if pr.TurnResponse.NextAction != nil {
-					fmt.Fprintf(os.Stderr, "  NextAction: %+v\n", pr.TurnResponse.NextAction)
-				}
-				if len(pr.TurnResponse.Tags) > 0 {
-					fmt.Fprintf(os.Stderr, "  Tags: %v\n", pr.TurnResponse.Tags)
-				}
-			}
+			debugPR(pr, username)
 		}
 	}
+	return count
+}
 
-	// Display header with beautiful styling
+func debugPR(pr PR, username string) {
+	blocking := isBlockingOnUser(pr, username)
+	fmt.Fprintf(os.Stderr, "[DEBUG] PR #%d (%s) - blocking: %v\n", pr.Number, pr.Title, blocking)
+	if pr.TurnResponse != nil {
+		if pr.TurnResponse.NextAction != nil {
+			fmt.Fprintf(os.Stderr, "  NextAction: %+v\n", pr.TurnResponse.NextAction)
+		}
+		if len(pr.TurnResponse.Tags) > 0 {
+			fmt.Fprintf(os.Stderr, "  Tags: %v\n", pr.TurnResponse.Tags)
+		}
+	}
+}
+
+func displayHeader(blockingOnly bool, blockingCount, incomingCount, outgoingCount int) {
 	fmt.Print("\n")
 	if blockingOnly && blockingCount > 0 {
 		header := fmt.Sprintf("🔥 %d PR%s awaiting your review", blockingCount, pluralize(blockingCount))
@@ -618,44 +661,43 @@ func displayPRs(prs []PR, username string, blockingOnly bool, debug bool) {
 	} else if !blockingOnly {
 		fmt.Println(titleStyle.Render("📋 Pull Request Dashboard"))
 		
-		// Add a summary line
-		totalPRs := len(incoming) + len(outgoing)
+		totalPRs := incomingCount + outgoingCount
 		summaryText := fmt.Sprintf("📊 %d total PR%s • %d incoming • %d outgoing • %d blocking you", 
-			totalPRs, pluralize(totalPRs), len(incoming), len(outgoing), blockingCount)
+			totalPRs, pluralize(totalPRs), incomingCount, outgoingCount, blockingCount)
 		fmt.Println(infoStyle.Render(summaryText))
 	}
+}
 
-	// Display incoming PRs (authored by others)
-	if len(incoming) > 0 && (!blockingOnly || blockingCount > 0) {
-		if !blockingOnly {
-			fmt.Print("\n")
-			fmt.Println(headerStyle.Render("⬇️  Incoming PRs"))
-		}
-		fmt.Print("\n")
+func shouldDisplayIncoming(incoming []PR, blockingOnly bool, blockingCount int) bool {
+	return len(incoming) > 0 && (!blockingOnly || blockingCount > 0)
+}
 
-		for _, pr := range incoming {
-			if blockingOnly && !isBlockingOnUser(pr, username) {
-				continue
-			}
-			displayPR(pr, username)
-		}
-	}
+func shouldDisplayOutgoing(outgoing []PR, blockingOnly bool) bool {
+	return len(outgoing) > 0 && !blockingOnly
+}
 
-	// Display outgoing PRs (authored by you) - only if --all flag is used
-	if len(outgoing) > 0 && !blockingOnly {
+func displayIncomingPRs(incoming []PR, username string, blockingOnly bool) {
+	if !blockingOnly {
 		fmt.Print("\n")
-		fmt.Println(headerStyle.Render("⬆️  Your PRs"))
-		fmt.Print("\n")
-		for _, pr := range outgoing {
-			displayPR(pr, username)
-		}
-	}
-
-	if blockingOnly && blockingCount == 0 {
-		fmt.Print("\n")
-		fmt.Println(successStyle.Render("✨ No PRs awaiting your review - you're all caught up!"))
+		fmt.Println(headerStyle.Render("⬇️  Incoming PRs"))
 	}
 	fmt.Print("\n")
+
+	for _, pr := range incoming {
+		if blockingOnly && !isBlockingOnUser(pr, username) {
+			continue
+		}
+		displayPR(pr, username)
+	}
+}
+
+func displayOutgoingPRs(outgoing []PR, username string) {
+	fmt.Print("\n")
+	fmt.Println(headerStyle.Render("⬆️  Your PRs"))
+	fmt.Print("\n")
+	for _, pr := range outgoing {
+		displayPR(pr, username)
+	}
 }
 
 func pluralize(count int) string {
@@ -704,15 +746,10 @@ func displayPR(pr PR, username string) {
 	// Create info line with indentation
 	infoLine := fmt.Sprintf("     %s • %s%s", ageFormatted, url, tagsDisplay)
 
-	// Add a subtle separator line
-	separator := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#444444")).
-		Render("    ─────────────────────────────────────────────────────────────────")
-
 	// Print with nice spacing
 	fmt.Println(prLine)
 	fmt.Println(infoLine)
-	fmt.Println(separator)
+	fmt.Println()
 }
 
 func getPRIcon(pr PR) string {
@@ -845,7 +882,7 @@ func runWatchMode(ctx context.Context, token, username string, blockingOnly bool
 
 		// Display PRs unless we're in notify-only mode
 		if !notifyMode {
-			displayHeader()
+			displayWatchHeader()
 			displayPRs(prs, username, blockingOnly, debug)
 		} else {
 			// In notify mode, show what we're watching for
@@ -888,7 +925,7 @@ func runWatchMode(ctx context.Context, token, username string, blockingOnly bool
 			// If not in notify-only mode, clear and redraw
 			if !notifyMode {
 				fmt.Print("\033[H\033[2J")
-				displayHeader()
+				displayWatchHeader()
 				displayPRs(prs, username, blockingOnly, debug)
 			}
 
@@ -946,26 +983,29 @@ func runWatchMode(ctx context.Context, token, username string, blockingOnly bool
 	}
 }
 
-func displayHeader() {
+func displayWatchHeader() {
 	header := "🔄 Live PR Dashboard - Press 'q' to quit"
 	fmt.Println(titleStyle.Render(header))
 	fmt.Println()
 }
 
-func wasBlockingBefore(pr PR, lastPRs []PR, username string) bool {
-	for _, oldPR := range lastPRs {
-		if oldPR.Number == pr.Number && oldPR.Repository.FullName == pr.Repository.FullName {
-			return isBlockingOnUser(oldPR, username)
-		}
+func wasBlockingBefore(pr PR, previous []PR, username string) bool {
+	if found, exists := findPRInList(pr, previous); exists {
+		return isBlockingOnUser(found, username)
 	}
 	return false
 }
 
-func wasPRBefore(pr PR, lastPRs []PR) bool {
-	for _, oldPR := range lastPRs {
-		if oldPR.Number == pr.Number && oldPR.Repository.FullName == pr.Repository.FullName {
-			return true
+func wasPRBefore(pr PR, previous []PR) bool {
+	_, exists := findPRInList(pr, previous)
+	return exists
+}
+
+func findPRInList(target PR, prs []PR) (PR, bool) {
+	for _, pr := range prs {
+		if pr.Number == target.Number && pr.Repository.FullName == target.Repository.FullName {
+			return pr, true
 		}
 	}
-	return false
+	return PR{}, false
 }
