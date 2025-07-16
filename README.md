@@ -1,48 +1,60 @@
-# GitHub PR Notifier CLI
+# 🚀 CLI Dash
 
-A fast, minimal command-line tool for tracking GitHub pull requests that need your attention.
+> Your personal GitHub PR dashboard that actually fits in your terminal
 
-## Installation
+A blazingly fast CLI tool that cuts through the noise to show you the PRs that matter. No more endless GitHub notifications or tab-switching madness.
+
+## Quick Start
 
 ```bash
 go install github.com/ready-to-review/github-pr-notifier-cli@latest
 ```
 
-Requires: Go 1.21+ and GitHub CLI (`gh`) authenticated
+**Prerequisites:** Go 1.23+ and GitHub CLI (`gh`) authenticated
 
 ## Usage
 
 ```bash
-# Show PRs awaiting your review (default)
+# The essentials - what needs your eyeballs?
 github-pr-notifier-cli
 
-# Show all PRs you're involved with  
+# Everything you're involved with
 github-pr-notifier-cli --all
 
-# Watch mode - refreshes every 10 minutes
+# Set it and forget it (refreshes every 10 min)
 github-pr-notifier-cli --watch
 
-# Notify mode - alerts on newly blocking PRs
+# Just the new stuff (notifications currently unavailable)
 github-pr-notifier-cli --notify
 ```
 
-## Output
+## What You'll See
 
 ```
-3 PRs awaiting your review
+🔥 2 PRs awaiting your review
 
-  • Fix authentication bug • 3h • https://github.com/org/repo/pull/123
-  • Add user preferences • 1d • https://github.com/org/repo/pull/456
+⬇️  Incoming PRs
+
+  ● 🚧 Fix authentication bug ⚡
+     3h • https://github.com/org/repo/pull/123
+
+  ● ✅ Add user preferences
+     1d • https://github.com/org/repo/pull/456
+
+⬆️  Your PRs
+
+  ● 📝 Update documentation
+     2h • https://github.com/org/repo/pull/789
 ```
 
 ## Options
 
-- `--all`: Show all PRs, not just those blocking on you
-- `--watch`: Continuously watch for updates (10 min intervals)
-- `--watch-interval N`: Set watch interval in minutes
-- `--notify`: Only show newly blocking PRs
-- `--verbose`: Show API call logs
+- `--all` - Show all your PRs, not just review requests
+- `--watch` - Keep watching for updates (10 min intervals)
+- `--watch-interval N` - Customize refresh rate (minutes)
+- `--notify` - New PR alerts (⚠️ currently disabled)
+- `--verbose` - Debug mode for the curious
 
-## Design
+## Why This Exists
 
-Built with Go best practices: minimal dependencies, fast execution, secure authentication via GitHub CLI.
+Because checking GitHub every 5 minutes is not a sustainable lifestyle choice. Built with Go for speed and your sanity.
