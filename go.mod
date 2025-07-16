@@ -1,4 +1,4 @@
-module github.com/ready-to-review/github-pr-notifier-cli
+module github.com/ready-to-review/prs
 
 go 1.23.4
 

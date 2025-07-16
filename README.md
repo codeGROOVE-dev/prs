@@ -1,13 +1,13 @@
-# 🚀 CLI Dash
+# 🚀 prs
 
-> Your personal GitHub PR dashboard that actually fits in your terminal
+> Only shows PRs waiting on YOU - preserving your focus time and sanity
 
-A blazingly fast CLI tool that cuts through the noise to show you the PRs that matter. No more endless GitHub notifications or tab-switching madness.
+A blazingly fast CLI tool that filters out all the noise to show only the PRs that need your action. No more context switching through dozens of PRs that don't need you right now.
 
 ## Quick Start
 
 ```bash
-go install github.com/ready-to-review/github-pr-notifier-cli@latest
+go install github.com/ready-to-review/prs/cmd/prs@latest
 ```
 
 **Prerequisites:** Go 1.23+ and GitHub CLI (`gh`) authenticated
@@ -15,17 +15,17 @@ go install github.com/ready-to-review/github-pr-notifier-cli@latest
 ## Usage
 
 ```bash
-# The essentials - what needs your eyeballs?
-github-pr-notifier-cli
+# The default - shows ONLY PRs waiting on your input
+prs
 
-# Everything you're involved with
-github-pr-notifier-cli --all
+# See everything you're involved with (if you really want to)
+prs --all
 
-# Set it and forget it (refreshes every 10 min)
-github-pr-notifier-cli --watch
+# Stay focused - auto-refresh what needs your attention (every 10 min)
+prs --watch
 
-# Just the new stuff (notifications currently unavailable)
-github-pr-notifier-cli --notify
+# Get alerted to newly blocking PRs (notifications currently unavailable)
+prs --notify
 ```
 
 ## What You'll See
@@ -57,4 +57,6 @@ github-pr-notifier-cli --notify
 
 ## Why This Exists
 
-Because checking GitHub every 5 minutes is not a sustainable lifestyle choice. Built with Go for speed and your sanity.
+**Focus is precious.** This tool shows ONLY the PRs blocked on your input - nothing else. No PRs waiting on CI, no PRs waiting on other reviewers, no PRs you've already reviewed. Just the ones that need you, right now.
+
+Built with Go for speed, because waiting for your tools is another focus killer.
