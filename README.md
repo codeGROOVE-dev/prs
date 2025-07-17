@@ -7,7 +7,7 @@ A blazingly fast CLI tool that filters out all the noise to show only the PRs th
 ## Quick Start
 
 ```bash
-go install github.com/ready-to-review/prs/cmd/prs@latest
+go install github.com/ready-to-review/prs@latest
 ```
 
 **Prerequisites:** Go 1.23+ and GitHub CLI (`gh`) authenticated
