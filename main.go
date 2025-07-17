@@ -903,15 +903,6 @@ func runWatchMode(ctx context.Context, token, username string, blockingOnly bool
 			fmt.Println(titleStyle.Render(header))
 			fmt.Println()
 			displayPRs(prs, username, blockingOnly, debug)
-		} else {
-			// In notify mode, show what we're watching for
-			if blockingOnly {
-				watchMsg := "🔍 Watching for newly blocking PRs..."
-				fmt.Println(infoStyle.Render(watchMsg))
-			} else {
-				watchMsg := "🔍 Watching for all new PRs..."
-				fmt.Println(infoStyle.Render(watchMsg))
-			}
 		}
 	}
 
@@ -945,53 +936,37 @@ func runWatchMode(ctx context.Context, token, username string, blockingOnly bool
 			if !notifyMode {
 				fmt.Print("\033[H\033[2J")
 				header := "🔄 Live PR Dashboard - Press 'q' to quit"
-			fmt.Println(titleStyle.Render(header))
-			fmt.Println()
+				fmt.Println(titleStyle.Render(header))
+				fmt.Println()
 				displayPRs(prs, username, blockingOnly, debug)
 			}
+			// In notify mode, don't clear screen - just show new PRs below
 
 			// Check for new PRs based on mode
 			if notifyMode {
 				if blockingOnly {
 					// Notify only for newly blocking PRs
+					// Show only newly blocking PRs with regular formatting
+					newBlockingPRs := []PR{}
 					for _, pr := range prs {
 						if isBlockingOnUser(pr, username) && !wasBlockingBefore(pr, lastPRs, username) {
-							fmt.Print("\n")
-							alertMsg := "⚡ NEW BLOCKING PR:"
-							fmt.Println(lipgloss.NewStyle().
-								Foreground(lipgloss.Color("#FF5555")).
-								Bold(true).
-								Render(alertMsg))
-							displayPR(pr, username)
-							fmt.Println()
+							newBlockingPRs = append(newBlockingPRs, pr)
 						}
 					}
+					for _, pr := range newBlockingPRs {
+						displayPR(pr, username)
+					}
 				} else {
-					// --notify --all: Show all new PRs
+					// Show all new PRs with regular formatting
+					newPRs := []PR{}
 					for _, pr := range prs {
 						_, exists := findPRInList(pr, lastPRs)
 						if !exists {
-							fmt.Print("\n")
-							alertMsg := "✨ NEW PR:"
-							fmt.Println(lipgloss.NewStyle().
-								Foreground(lipgloss.Color("#00FF00")).
-								Bold(true).
-								Render(alertMsg))
-							displayPR(pr, username)
-							fmt.Println()
+							newPRs = append(newPRs, pr)
 						}
 					}
-				}
-			} else {
-				// In watch mode, just note newly blocking PRs
-				for _, pr := range prs {
-					if isBlockingOnUser(pr, username) && !wasBlockingBefore(pr, lastPRs, username) {
-						newPRMsg := fmt.Sprintf("⚡ NEW BLOCKING PR: %s", pr.Title)
-						fmt.Print("\n")
-						fmt.Println(lipgloss.NewStyle().
-							Foreground(lipgloss.Color("#FF5555")).
-							Bold(true).
-							Render(newPRMsg))
+					for _, pr := range newPRs {
+						displayPR(pr, username)
 					}
 				}
 			}
