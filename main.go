@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -14,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -61,9 +64,15 @@ type SearchResult struct {
 	Items []PR `json:"items"`
 }
 
+// cacheEntry represents a cached Turn API response.
+type cacheEntry struct {
+	Response  *turn.CheckResponse `json:"response"`
+	Timestamp time.Time           `json:"timestamp"`
+}
+
 const (
 	defaultTimeout          = 30 * time.Second
-	defaultWatchInterval    = 10
+	defaultWatchInterval    = 90 * time.Second
 	maxPerPage              = 100
 	retryAttempts           = 3
 	retryDelay              = time.Second
@@ -71,15 +80,12 @@ const (
 	enrichRetries        = 2
 	enrichDelay          = 500 * time.Millisecond
 	enrichMaxDelay       = 2 * time.Second
-	maxTitleLength          = 60
-	minPRURLParts           = 7
 	apiUserEndpoint         = "https://api.github.com/user"
 	apiSearchEndpoint    = "https://api.github.com/search/issues"
 	apiPullsEndpoint     = "https://api.github.com/repos/%s/%s/pulls/%d"
-	acceptHeader            = "application/vnd.github.v3+json"
-	userAgentHeader         = "github-pr-notifier-cli"
 	defaultTurnServerURL    = "https://turn.ready-to-review.dev"
 	maxConcurrent        = 20 // Increased for better throughput
+	cacheTTL             = 5 * 24 * time.Hour // 5 days
 )
 
 // Style definitions.
@@ -115,17 +121,6 @@ var (
 	successStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#5F27CD")).
 			Bold(true)
-
-	borderStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#874BFD")).
-			Padding(1, 2)
-
-	boxStyle = lipgloss.NewStyle().
-			Border(lipgloss.NormalBorder()).
-			BorderForeground(lipgloss.Color("#874BFD")).
-			Padding(0, 1).
-			Margin(0, 1)
 )
 
 // isValidOrgName validates GitHub organization names.
@@ -143,10 +138,52 @@ func isValidOrgName(org string) bool {
 	return org[0] != '-' && org[len(org)-1] != '-'
 }
 
+// turnCache handles caching of Turn API responses.
+func turnCachePath(url string, updatedAt time.Time) string {
+	dir, _ := os.UserCacheDir()
+	if dir == "" {
+		return "" // No cache if we can't find cache dir
+	}
+	
+	// Simple hash for filename
+	h := sha256.Sum256([]byte(url + updatedAt.Format(time.RFC3339)))
+	return filepath.Join(dir, "github-pr-notifier", "turn-cache", hex.EncodeToString(h[:8])+".json")
+}
+
+func loadTurnCache(path string) (*turn.CheckResponse, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	
+	var entry cacheEntry
+	if json.Unmarshal(data, &entry) != nil {
+		return nil, false
+	}
+	
+	// Check if expired
+	if time.Since(entry.Timestamp) > cacheTTL {
+		os.Remove(path)
+		return nil, false
+	}
+	
+	return entry.Response, true
+}
+
+func saveTurnCache(path string, response *turn.CheckResponse) {
+	if path == "" {
+		return
+	}
+	
+	os.MkdirAll(filepath.Dir(path), 0755)
+	data, _ := json.Marshal(cacheEntry{Response: response, Timestamp: time.Now()})
+	os.WriteFile(path, data, 0644)
+}
+
 func main() {
 	var (
 		watch         = flag.Bool("watch", false, "Continuously watch for PR updates")
-		watchInterval = flag.Int("watch-interval", defaultWatchInterval, "Watch interval in minutes (default: 10)")
+		watchInterval = flag.Duration("watch-interval", defaultWatchInterval, "Watch interval (default: 90s)")
 		all           = flag.Bool("all", false, "Show all PRs (not just those blocking on you)")
 		notify        = flag.Bool("notify", false, "Watch for PRs and notify when they become newly blocking")
 		turnServer    = flag.String("turn-server", defaultTurnServerURL, "Turn server URL for enhanced metadata")
@@ -290,8 +327,8 @@ func currentUser(token string, logger *log.Logger, httpClient *http.Client) (str
 			}
 
 			req.Header.Set("Authorization", "token "+token)
-			req.Header.Set("Accept", acceptHeader)
-			req.Header.Set("User-Agent", userAgentHeader)
+			req.Header.Set("Accept", "application/vnd.github.v3+json")
+			req.Header.Set("User-Agent", "github-pr-notifier-cli")
 
 			resp, err := httpClient.Do(req)
 			if err != nil {
@@ -414,8 +451,8 @@ func makeGitHubSearchRequest(ctx context.Context, query, token string, httpClien
 	}
 
 	req.Header.Set("Authorization", "token "+token)
-	req.Header.Set("Accept", acceptHeader)
-	req.Header.Set("User-Agent", userAgentHeader)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	req.Header.Set("User-Agent", "github-pr-notifier-cli")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
 	start := time.Now()
@@ -458,24 +495,7 @@ func parseSearchResponse(resp *http.Response) ([]PR, error) {
 }
 
 func handleHTTPError(resp *http.Response, message string) error {
-	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1024)) // Limit error response size
-	if readErr != nil {
-		return fmt.Errorf("%s (status %d): failed to read error response: %w", message, resp.StatusCode, readErr)
-	}
-	
-	// Try to parse GitHub error message
-	var errorResp struct {
-		Message string `json:"message"`
-		Errors  []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-	
-	if err := json.Unmarshal(body, &errorResp); err == nil && errorResp.Message != "" {
-		return fmt.Errorf("%s (status %d): %s", message, resp.StatusCode, errorResp.Message)
-	}
-	
-	return fmt.Errorf("%s (status %d): %s", message, resp.StatusCode, string(body))
+	return fmt.Errorf("%s: status %d", message, resp.StatusCode)
 }
 
 func deduplicatePRs(prs []PR) []PR {
@@ -515,7 +535,7 @@ func enrichPRsParallel(ctx context.Context, token string, prs []PR, logger *log.
 			}()
 			
 			// Ignore non-critical errors - let the app continue
-			if err := enrichPRData(ctx, token, pr, logger, httpClient, turnClient, debug); err != nil {
+			if err := enrichPRData(ctx, pr, logger, turnClient, debug); err != nil {
 				if errors.Is(err, context.Canceled) {
 					return
 				}
@@ -529,7 +549,7 @@ func enrichPRsParallel(ctx context.Context, token string, prs []PR, logger *log.
 }
 
 
-func enrichPRData(ctx context.Context, token string, pr *PR, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, debug bool) error {
+func enrichPRData(ctx context.Context, pr *PR, logger *log.Logger, turnClient *turn.Client, debug bool) error {
 	start := time.Now()
 	defer func() {
 		if debug {
@@ -537,65 +557,8 @@ func enrichPRData(ctx context.Context, token string, pr *PR, logger *log.Logger,
 		}
 	}()
 
-	// Extract repo and number from URL
-	parts := strings.Split(pr.HTMLURL, "/")
-	if len(parts) < minPRURLParts {
-		return errors.New("invalid PR URL")
-	}
-	owner := parts[3]
-	repo := parts[4]
-
-	// Fetch PR details
-	url := fmt.Sprintf(apiPullsEndpoint, owner, repo, pr.Number)
-
-	githubStart := time.Now()
-	err := retry.Do(
-		func() error {
-			logger.Printf("Making API call to GET %s", url)
-			req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-			if err != nil {
-				return err
-			}
-
-			req.Header.Set("Authorization", "token "+token)
-			req.Header.Set("Accept", acceptHeader)
-			req.Header.Set("User-Agent", userAgentHeader)
-
-			resp, err := httpClient.Do(req)
-			if err != nil {
-				return err
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode == http.StatusNotFound {
-				return errors.New("pr not found")
-			}
-			if resp.StatusCode != http.StatusOK {
-				return fmt.Errorf("failed to fetch pr details: status %d", resp.StatusCode)
-			}
-
-			// Update PR with detailed info
-			if err := json.NewDecoder(resp.Body).Decode(pr); err != nil {
-				return err
-			}
-
-			return nil
-		},
-		retry.Context(ctx),
-		retry.Attempts(enrichRetries),
-		retry.Delay(enrichDelay),
-		retry.MaxDelay(enrichMaxDelay),
-		retry.DelayType(retry.BackOffDelay),
-		retry.LastErrorOnly(true),
-	)
-	
-	if err != nil {
-		return err
-	}
-
-	if debug {
-		logger.Printf("GitHub API call for PR #%d took %v", pr.Number, time.Since(githubStart))
-	}
+	// The search API already provides all the PR data we need,
+	// so we can skip individual PR API calls entirely
 
 	// Enrich with turn server data if available
 	if turnClient != nil {
@@ -603,6 +566,18 @@ func enrichPRData(ctx context.Context, token string, pr *PR, logger *log.Logger,
 		if pr.HTMLURL == "" || !strings.HasPrefix(pr.HTMLURL, "https://github.com/") {
 			logger.Printf("WARNING: Invalid PR URL for turn enrichment: %s", pr.HTMLURL)
 			return nil
+		}
+		
+		// Check cache first
+		cachePath := turnCachePath(pr.HTMLURL, pr.UpdatedAt)
+		if cached, found := loadTurnCache(cachePath); found {
+			pr.TurnResponse = cached
+			return nil
+		}
+		
+		// Cache miss
+		if debug && cachePath != "" {
+			logger.Printf("INFO: Cache miss for PR #%d", pr.Number)
 		}
 		
 		turnStart := time.Now()
@@ -617,6 +592,8 @@ func enrichPRData(ctx context.Context, token string, pr *PR, logger *log.Logger,
 			// Don't fail the entire enrichment if turn server is unavailable
 		} else if turnResponse != nil {
 			pr.TurnResponse = turnResponse
+			// Save to cache
+			saveTurnCache(cachePath, turnResponse)
 			if debug {
 				logger.Printf("Turn server call for PR #%d took %v", pr.Number, time.Since(turnStart))
 				responseJSON, _ := json.MarshalIndent(turnResponse, "", "  ")
@@ -767,7 +744,7 @@ func displayPR(pr PR, username string) {
 	// Create styled components
 	bullet := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF79C6")).Render("●")
 	prIcon := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF79C6")).Render(icon)
-	title := prTitleStyle.Render(truncate(pr.Title, maxTitleLength))
+	title := prTitleStyle.Render(truncate(pr.Title, 60))
 	ageFormatted := ageStyle.Render(age)
 	url := urlStyle.Render(truncateURL(pr.HTMLURL, 80))
 
@@ -903,12 +880,12 @@ func truncateURL(url string, maxLen int) string {
 	return truncate(url, maxLen)
 }
 
-func runWatchMode(ctx context.Context, token, username string, blockingOnly bool, notifyMode bool, intervalMinutes int, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, debug bool, org string) {
+func runWatchMode(ctx context.Context, token, username string, blockingOnly bool, notifyMode bool, interval time.Duration, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, debug bool, org string) {
 	// Clear screen
 	fmt.Print("\033[H\033[2J")
 
 	var lastPRs []PR
-	ticker := time.NewTicker(time.Duration(intervalMinutes) * time.Minute)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	// Initial fetch and display (unless notify-only mode)
