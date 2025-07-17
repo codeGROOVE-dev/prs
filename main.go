@@ -742,7 +742,13 @@ func displayPR(pr PR, username string) {
 	}
 
 	// Create styled components
-	bullet := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF79C6")).Render("●")
+	var bulletColor string
+	if isBlockingOnUser(pr, username) {
+		bulletColor = "#FF0000" // Intense red for blocked PRs
+	} else {
+		bulletColor = "#FF79C6" // Pink for regular PRs
+	}
+	bullet := lipgloss.NewStyle().Foreground(lipgloss.Color(bulletColor)).Render("●")
 	prIcon := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF79C6")).Render(icon)
 	title := prTitleStyle.Render(truncate(pr.Title, 60))
 	ageFormatted := ageStyle.Render(age)
@@ -881,8 +887,10 @@ func truncateURL(url string, maxLen int) string {
 }
 
 func runWatchMode(ctx context.Context, token, username string, blockingOnly bool, notifyMode bool, interval time.Duration, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, debug bool, org string) {
-	// Clear screen
-	fmt.Print("\033[H\033[2J")
+	// Clear screen only if not in notify mode
+	if !notifyMode {
+		fmt.Print("\033[H\033[2J")
+	}
 
 	var lastPRs []PR
 	ticker := time.NewTicker(interval)
@@ -895,10 +903,9 @@ func runWatchMode(ctx context.Context, token, username string, blockingOnly bool
 			fmt.Fprintf(os.Stderr, "Error fetching PRs: %v\n", err)
 		}
 	} else {
-		lastPRs = prs
-
-		// Display PRs unless we're in notify-only mode
+		// In notify mode, don't set lastPRs initially - start fresh
 		if !notifyMode {
+			lastPRs = prs
 			header := "🔄 Live PR Dashboard - Press 'q' to quit"
 			fmt.Println(titleStyle.Render(header))
 			fmt.Println()
