@@ -85,7 +85,7 @@ const (
 	apiPullsEndpoint     = "https://api.github.com/repos/%s/%s/pulls/%d"
 	defaultTurnServerURL    = "https://turn.ready-to-review.dev"
 	maxConcurrent        = 20 // Increased for better throughput
-	cacheTTL             = 5 * 24 * time.Hour // 5 days
+	cacheTTL             = 2 * time.Hour // 2 hours
 )
 
 // Style definitions.
