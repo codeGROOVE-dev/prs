@@ -39,11 +39,16 @@ type PR struct {
 	Draft          bool      `json:"draft"`
 	ReviewComments int       `json:"review_comments"`
 	Comments       int       `json:"comments"`
-	Repository struct {
+	Repository     struct {
 		FullName string `json:"full_name"`
 	} `json:"repository"`
 	RequestedReviewers []User `json:"requested_reviewers"`
-	
+
+	// Size information
+	Additions    int `json:"additions"`
+	Deletions    int `json:"deletions"`
+	ChangedFiles int `json:"changed_files"`
+
 	// Turn server metadata
 	TurnResponse *turn.CheckResponse `json:"turn_response,omitempty"`
 }
@@ -71,20 +76,20 @@ type cacheEntry struct {
 }
 
 const (
-	defaultTimeout          = 30 * time.Second
-	defaultWatchInterval    = 90 * time.Second
-	maxPerPage              = 100
-	retryAttempts           = 3
-	retryDelay              = time.Second
-	retryMaxDelay           = 10 * time.Second
+	defaultTimeout       = 30 * time.Second
+	defaultWatchInterval = 90 * time.Second
+	maxPerPage           = 100
+	retryAttempts        = 3
+	retryDelay           = time.Second
+	retryMaxDelay        = 10 * time.Second
 	enrichRetries        = 2
 	enrichDelay          = 500 * time.Millisecond
 	enrichMaxDelay       = 2 * time.Second
-	apiUserEndpoint         = "https://api.github.com/user"
+	apiUserEndpoint      = "https://api.github.com/user"
 	apiSearchEndpoint    = "https://api.github.com/search/issues"
 	apiPullsEndpoint     = "https://api.github.com/repos/%s/%s/pulls/%d"
-	defaultTurnServerURL    = "https://turn.ready-to-review.dev"
-	maxConcurrent        = 20 // Increased for better throughput
+	defaultTurnServerURL = "https://turn.ready-to-review.dev"
+	maxConcurrent        = 20            // Increased for better throughput
 	cacheTTL             = 2 * time.Hour // 2 hours
 )
 
@@ -129,7 +134,7 @@ func isValidOrgName(org string) bool {
 		return false
 	}
 	for _, r := range org {
-		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || 
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
 			(r >= '0' && r <= '9') || r == '-' || r == '_') {
 			return false
 		}
@@ -144,7 +149,7 @@ func turnCachePath(url string, updatedAt time.Time) string {
 	if dir == "" {
 		return "" // No cache if we can't find cache dir
 	}
-	
+
 	// Simple hash for filename
 	h := sha256.Sum256([]byte(url + updatedAt.Format(time.RFC3339)))
 	return filepath.Join(dir, "github-pr-notifier", "turn-cache", hex.EncodeToString(h[:8])+".json")
@@ -155,18 +160,18 @@ func loadTurnCache(path string) (*turn.CheckResponse, bool) {
 	if err != nil {
 		return nil, false
 	}
-	
+
 	var entry cacheEntry
 	if json.Unmarshal(data, &entry) != nil {
 		return nil, false
 	}
-	
+
 	// Check if expired
 	if time.Since(entry.Timestamp) > cacheTTL {
 		os.Remove(path)
 		return nil, false
 	}
-	
+
 	return entry.Response, true
 }
 
@@ -174,17 +179,17 @@ func saveTurnCache(path string, response *turn.CheckResponse) {
 	if path == "" {
 		return
 	}
-	
-	os.MkdirAll(filepath.Dir(path), 0755)
+
+	os.MkdirAll(filepath.Dir(path), 0o755)
 	data, _ := json.Marshal(cacheEntry{Response: response, Timestamp: time.Now()})
-	os.WriteFile(path, data, 0644)
+	os.WriteFile(path, data, 0o644)
 }
 
 func main() {
 	var (
 		watch         = flag.Bool("watch", false, "Continuously watch for PR updates")
 		watchInterval = flag.Duration("watch-interval", defaultWatchInterval, "Watch interval (default: 90s)")
-		all           = flag.Bool("all", false, "Show all PRs (not just those blocking on you)")
+		blocked       = flag.Bool("blocked", false, "Show only PRs blocking on you")
 		notify        = flag.Bool("notify", false, "Watch for PRs and notify when they become newly blocking")
 		turnServer    = flag.String("turn-server", defaultTurnServerURL, "Turn server URL for enhanced metadata")
 		org           = flag.String("org", "", "Filter PRs to specific organization")
@@ -192,7 +197,7 @@ func main() {
 	)
 	flag.BoolVar(&debug, "debug", false, "Show debug information including API calls and turnclient data")
 	flag.Parse()
-	
+
 	// Validate org parameter to prevent injection
 	if *org != "" {
 		// Allow only alphanumeric, dash, and underscore (GitHub org naming rules)
@@ -214,12 +219,12 @@ func main() {
 	httpClient := &http.Client{
 		Timeout: defaultTimeout,
 		Transport: &http.Transport{
-			MaxIdleConns:        100,  // Increased for better connection reuse
-			MaxIdleConnsPerHost: 10,   // Allow more connections per host
+			MaxIdleConns:        100, // Increased for better connection reuse
+			MaxIdleConnsPerHost: 10,  // Allow more connections per host
 			IdleConnTimeout:     90 * time.Second,
 			DisableKeepAlives:   false,
 			DisableCompression:  false,
-			ForceAttemptHTTP2:   true,  // Use HTTP/2 when available
+			ForceAttemptHTTP2:   true, // Use HTTP/2 when available
 		},
 	}
 
@@ -273,7 +278,7 @@ func main() {
 
 	// If either watch or notify is set, run in watch mode
 	if *watch || *notify {
-		runWatchMode(ctx, token, username, !*all, *notify, *watchInterval, logger, httpClient, turnClient, debug, *org)
+		runWatchMode(ctx, token, username, *blocked, *notify, *watchInterval, logger, httpClient, turnClient, debug, *org)
 	} else {
 		// One-time display
 		prs, err := fetchPRsWithRetry(ctx, token, username, logger, httpClient, turnClient, debug, *org)
@@ -285,14 +290,14 @@ func main() {
 			}
 			os.Exit(1)
 		}
-		displayPRs(prs, username, !*all, debug)
+		displayPRs(prs, username, *blocked, debug)
 	}
 }
 
 func gitHubToken() (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	
+
 	cmd := exec.CommandContext(ctx, "gh", "auth", "token")
 	output, err := cmd.Output()
 	if err != nil {
@@ -301,17 +306,17 @@ func gitHubToken() (string, error) {
 		}
 		return "", fmt.Errorf("failed to get auth token (is 'gh' installed and authenticated?): %w", err)
 	}
-	
+
 	token := strings.TrimSpace(string(output))
 	if token == "" {
 		return "", fmt.Errorf("empty auth token received")
 	}
-	
+
 	// Basic validation - GitHub tokens should be non-empty alphanumeric strings
 	if len(token) < 10 {
 		return "", fmt.Errorf("invalid token format")
 	}
-	
+
 	return token, nil
 }
 
@@ -401,28 +406,50 @@ func fetchPRsWithRetry(ctx context.Context, token, username string, logger *log.
 }
 
 func fetchPRs(ctx context.Context, token, username string, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, debug bool, org string) ([]PR, error) {
-	query := fmt.Sprintf("involves:%s type:pr state:open", username)
+	// Query 1: PRs that involve the user (mentioned, assigned, review requested, etc.)
+	query1 := fmt.Sprintf("is:open is:pr involves:%s archived:false", username)
 	if org != "" {
 		// org is already validated, safe to use
-		query += fmt.Sprintf(" org:%s", org)
+		query1 += fmt.Sprintf(" org:%s", org)
 	}
-	
-	resp, err := makeGitHubSearchRequest(ctx, query, token, httpClient, logger)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
 
-	prs, err := parseSearchResponse(resp)
+	// Query 2: PRs authored by the user
+	query2 := fmt.Sprintf("is:open is:pr user:%s archived:false", username)
+	if org != "" {
+		query2 += fmt.Sprintf(" org:%s", org)
+	}
+
+	// Execute both queries
+	resp1, err := makeGitHubSearchRequest(ctx, query1, token, httpClient, logger)
 	if err != nil {
 		return nil, err
 	}
+	defer resp1.Body.Close()
+
+	prs1, err := parseSearchResponse(resp1)
+	if err != nil {
+		return nil, err
+	}
+
+	resp2, err := makeGitHubSearchRequest(ctx, query2, token, httpClient, logger)
+	if err != nil {
+		return nil, err
+	}
+	defer resp2.Body.Close()
+
+	prs2, err := parseSearchResponse(resp2)
+	if err != nil {
+		return nil, err
+	}
+
+	// Combine results
+	prs := append(prs1, prs2...)
 
 	logger.Printf("Found %d PRs (before deduplication)", len(prs))
 	prs = deduplicatePRs(prs)
 	logger.Printf("Found %d PRs (after deduplication)", len(prs))
 
-	if err := enrichPRsParallel(ctx, token, prs, logger, httpClient, turnClient, debug); err != nil {
+	if err := enrichPRsParallel(ctx, token, prs, logger, httpClient, turnClient, username, debug); err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil, err
 		}
@@ -434,7 +461,6 @@ func fetchPRs(ctx context.Context, token, username string, logger *log.Logger, h
 
 	return prs, nil
 }
-
 
 func makeGitHubSearchRequest(ctx context.Context, query, token string, httpClient *http.Client, logger *log.Logger) (*http.Response, error) {
 	params := url.Values{}
@@ -466,7 +492,7 @@ func makeGitHubSearchRequest(ctx context.Context, query, token string, httpClien
 		return nil, fmt.Errorf("github api request failed: %w", err)
 	}
 	logger.Printf("INFO: GitHub API request completed in %v with status %d", elapsed, resp.StatusCode)
-	
+
 	return resp, nil
 }
 
@@ -502,40 +528,40 @@ func deduplicatePRs(prs []PR) []PR {
 	if len(prs) <= 1 {
 		return prs
 	}
-	
+
 	seen := make(map[string]PR, len(prs))
-	
+
 	for _, pr := range prs {
 		if existing, exists := seen[pr.HTMLURL]; !exists || pr.UpdatedAt.After(existing.UpdatedAt) {
 			seen[pr.HTMLURL] = pr
 		}
 	}
-	
+
 	result := make([]PR, 0, len(seen))
 	for _, pr := range seen {
 		result = append(result, pr)
 	}
-	
+
 	return result
 }
 
-func enrichPRsParallel(ctx context.Context, token string, prs []PR, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, debug bool) error {
+func enrichPRsParallel(ctx context.Context, token string, prs []PR, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, username string, debug bool) error {
 	// Simple semaphore pattern - Rob Pike style
 	sem := make(chan struct{}, maxConcurrent)
 	var wg sync.WaitGroup
-	
+
 	for i := range prs {
 		wg.Add(1)
 		sem <- struct{}{} // acquire semaphore
-		
+
 		go func(pr *PR) {
 			defer func() {
 				<-sem // release semaphore
 				wg.Done()
 			}()
-			
+
 			// Ignore non-critical errors - let the app continue
-			if err := enrichPRData(ctx, pr, logger, turnClient, debug); err != nil {
+			if err := enrichPRData(ctx, pr, logger, turnClient, username, debug); err != nil {
 				if errors.Is(err, context.Canceled) {
 					return
 				}
@@ -543,13 +569,70 @@ func enrichPRsParallel(ctx context.Context, token string, prs []PR, logger *log.
 			}
 		}(&prs[i])
 	}
-	
+
 	wg.Wait()
 	return nil
 }
 
+func fetchPRDetails(ctx context.Context, pr *PR, logger *log.Logger, debug bool) error {
+	// Get token from environment
+	token := os.Getenv("GITHUB_TOKEN")
+	if token == "" {
+		return fmt.Errorf("GITHUB_TOKEN not set")
+	}
 
-func enrichPRData(ctx context.Context, pr *PR, logger *log.Logger, turnClient *turn.Client, debug bool) error {
+	// Extract repository info from PR URL
+	// URL format: https://github.com/owner/repo/pull/123
+	parts := strings.Split(pr.HTMLURL, "/")
+	if len(parts) < 6 {
+		return fmt.Errorf("invalid PR URL format: %s", pr.HTMLURL)
+	}
+	owner := parts[3]
+	repo := parts[4]
+
+	// Build API URL
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d", owner, repo, pr.Number)
+
+	// Create request
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Authorization", "token "+token)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	// Make request
+	client := &http.Client{Timeout: defaultTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("GitHub API returned status %d", resp.StatusCode)
+	}
+
+	// Parse response
+	var prDetails PR
+	if err := json.NewDecoder(resp.Body).Decode(&prDetails); err != nil {
+		return err
+	}
+
+	// Update PR with size information
+	pr.Additions = prDetails.Additions
+	pr.Deletions = prDetails.Deletions
+	pr.ChangedFiles = prDetails.ChangedFiles
+
+	if debug {
+		logger.Printf("Fetched PR #%d size: +%d/-%d files:%d", pr.Number, pr.Additions, pr.Deletions, pr.ChangedFiles)
+	}
+
+	return nil
+}
+
+func enrichPRData(ctx context.Context, pr *PR, logger *log.Logger, turnClient *turn.Client, username string, debug bool) error {
 	start := time.Now()
 	defer func() {
 		if debug {
@@ -557,8 +640,11 @@ func enrichPRData(ctx context.Context, pr *PR, logger *log.Logger, turnClient *t
 		}
 	}()
 
-	// The search API already provides all the PR data we need,
-	// so we can skip individual PR API calls entirely
+	// Fetch individual PR data to get size information
+	if err := fetchPRDetails(ctx, pr, logger, debug); err != nil {
+		logger.Printf("WARNING: Failed to fetch PR details for #%d: %v", pr.Number, err)
+		// Continue without size info
+	}
 
 	// Enrich with turn server data if available
 	if turnClient != nil {
@@ -567,26 +653,26 @@ func enrichPRData(ctx context.Context, pr *PR, logger *log.Logger, turnClient *t
 			logger.Printf("WARNING: Invalid PR URL for turn enrichment: %s", pr.HTMLURL)
 			return nil
 		}
-		
+
 		// Check cache first
 		cachePath := turnCachePath(pr.HTMLURL, pr.UpdatedAt)
 		if cached, found := loadTurnCache(cachePath); found {
 			pr.TurnResponse = cached
 			return nil
 		}
-		
+
 		// Cache miss
 		if debug && cachePath != "" {
 			logger.Printf("INFO: Cache miss for PR #%d", pr.Number)
 		}
-		
+
 		turnStart := time.Now()
 		if debug {
-			logger.Printf("Sending turnclient request for PR #%d: URL=%s, UpdatedAt=%s", 
+			logger.Printf("Sending turnclient request for PR #%d: URL=%s, UpdatedAt=%s",
 				pr.Number, pr.HTMLURL, pr.UpdatedAt.Format(time.RFC3339))
 		}
-		
-		turnResponse, err := turnClient.Check(ctx, pr.HTMLURL, pr.UpdatedAt)
+
+		turnResponse, err := turnClient.Check(ctx, pr.HTMLURL, username, pr.UpdatedAt)
 		if err != nil {
 			logger.Printf("WARNING: Failed to get turn data for PR #%d: %v", pr.Number, err)
 			// Don't fail the entire enrichment if turn server is unavailable
@@ -607,11 +693,11 @@ func enrichPRData(ctx context.Context, pr *PR, logger *log.Logger, turnClient *t
 
 func isBlockingOnUser(pr PR, username string) bool {
 	// If we have turn client data, use that for blocking determination
-	if pr.TurnResponse != nil && pr.TurnResponse.NextAction != nil {
-		_, hasAction := pr.TurnResponse.NextAction[username]
+	if pr.TurnResponse != nil && pr.TurnResponse.PRState.UnblockAction != nil {
+		_, hasAction := pr.TurnResponse.PRState.UnblockAction[username]
 		return hasAction
 	}
-	
+
 	// Fallback to GitHub API requested reviewers if no turn data
 	for _, reviewer := range pr.RequestedReviewers {
 		if reviewer.Login == username {
@@ -626,15 +712,15 @@ func displayPRs(prs []PR, username string, blockingOnly bool, debug bool) {
 	blockingCount := countBlockingPRs(incoming, username, debug)
 
 	displayHeader(blockingOnly, blockingCount, len(incoming), len(outgoing))
-	
+
 	if len(incoming) > 0 && (!blockingOnly || blockingCount > 0) {
 		displayIncomingPRs(incoming, username, blockingOnly)
 	}
-	
+
 	if len(outgoing) > 0 && !blockingOnly {
 		displayOutgoingPRs(outgoing, username)
 	}
-	
+
 	if blockingOnly && blockingCount == 0 {
 		fmt.Print("\n")
 		fmt.Println(successStyle.Render("✨ No PRs awaiting your review - you're all caught up!"))
@@ -670,11 +756,11 @@ func debugPR(pr PR, username string) {
 	blocking := isBlockingOnUser(pr, username)
 	fmt.Fprintf(os.Stderr, "[DEBUG] PR #%d (%s) - blocking: %v\n", pr.Number, pr.Title, blocking)
 	if pr.TurnResponse != nil {
-		if pr.TurnResponse.NextAction != nil {
-			fmt.Fprintf(os.Stderr, "  NextAction: %+v\n", pr.TurnResponse.NextAction)
+		if pr.TurnResponse.PRState.UnblockAction != nil {
+			fmt.Fprintf(os.Stderr, "  UnblockAction: %+v\n", pr.TurnResponse.PRState.UnblockAction)
 		}
-		if len(pr.TurnResponse.Tags) > 0 {
-			fmt.Fprintf(os.Stderr, "  Tags: %v\n", pr.TurnResponse.Tags)
+		if len(pr.TurnResponse.PRState.Tags) > 0 {
+			fmt.Fprintf(os.Stderr, "  Tags: %v\n", pr.TurnResponse.PRState.Tags)
 		}
 	}
 }
@@ -690,21 +776,34 @@ func displayHeader(blockingOnly bool, blockingCount, incomingCount, outgoingCoun
 		fmt.Println(titleStyle.Render(header))
 	} else if !blockingOnly {
 		fmt.Println(titleStyle.Render("📋 Pull Request Dashboard"))
-		
+
 		totalPRs := incomingCount + outgoingCount
-		summaryText := fmt.Sprintf("📊 %d total PR%s • %d incoming • %d outgoing • %d blocking you", 
-			totalPRs, func() string { if totalPRs == 1 { return "" }; return "s" }(), incomingCount, outgoingCount, blockingCount)
+		summaryText := fmt.Sprintf("📊 %d total PR%s • %d incoming • %d outgoing • %d blocking you",
+			totalPRs, func() string {
+				if totalPRs == 1 {
+					return ""
+				}
+				return "s"
+			}(), incomingCount, outgoingCount, blockingCount)
 		fmt.Println(infoStyle.Render(summaryText))
 	}
 }
 
-
 func displayIncomingPRs(incoming []PR, username string, blockingOnly bool) {
-	if !blockingOnly {
+	// Count PRs that will actually be displayed
+	displayCount := 0
+	for _, pr := range incoming {
+		if !blockingOnly || isBlockingOnUser(pr, username) {
+			displayCount++
+		}
+	}
+
+	// Only show header if there are PRs to display
+	if displayCount > 0 {
 		fmt.Print("\n")
 		fmt.Println(headerStyle.Render("⬇️  Incoming PRs"))
+		fmt.Print("\n")
 	}
-	fmt.Print("\n")
 
 	for _, pr := range incoming {
 		if blockingOnly && !isBlockingOnUser(pr, username) {
@@ -723,7 +822,6 @@ func displayOutgoingPRs(outgoing []PR, username string) {
 	}
 }
 
-
 func displayPR(pr PR, username string) {
 	// Format age
 	age := formatAge(pr.UpdatedAt)
@@ -733,9 +831,9 @@ func displayPR(pr PR, username string) {
 
 	// Prepare tags display with colors
 	var tagsDisplay string
-	if pr.TurnResponse != nil && len(pr.TurnResponse.Tags) > 0 {
+	if pr.TurnResponse != nil && len(pr.TurnResponse.PRState.Tags) > 0 {
 		var coloredTags []string
-		for _, tag := range pr.TurnResponse.Tags {
+		for _, tag := range pr.TurnResponse.PRState.Tags {
 			coloredTags = append(coloredTags, coloredTag(tag))
 		}
 		tagsDisplay = fmt.Sprintf(" %s", strings.Join(coloredTags, " "))
@@ -756,7 +854,7 @@ func displayPR(pr PR, username string) {
 
 	// Create the main PR line with bullet
 	prLine := fmt.Sprintf("  %s %s %s", bullet, prIcon, title)
-	
+
 	// Add blocking indicator if user is blocked
 	if isBlockingOnUser(pr, username) {
 		blockingIndicator := lipgloss.NewStyle().
@@ -766,8 +864,14 @@ func displayPR(pr PR, username string) {
 		prLine += blockingIndicator
 	}
 
+	// Create size display
+	var sizeDisplay string
+	if pr.Additions > 0 || pr.Deletions > 0 || pr.ChangedFiles > 0 {
+		sizeDisplay = fmt.Sprintf(" +%d/-%d (%d files)", pr.Additions, pr.Deletions, pr.ChangedFiles)
+	}
+
 	// Create info line with indentation
-	infoLine := fmt.Sprintf("     %s • %s%s", ageFormatted, url, tagsDisplay)
+	infoLine := fmt.Sprintf("     %s • %s%s%s", ageFormatted, url, sizeDisplay, tagsDisplay)
 
 	// Print with nice spacing
 	fmt.Println(prLine)
@@ -779,11 +883,11 @@ func prIcon(pr PR) string {
 	if pr.Draft {
 		return "🚧"
 	}
-	if pr.TurnResponse != nil && pr.TurnResponse.ReadyToMerge {
+	if pr.TurnResponse != nil && pr.TurnResponse.PRState.ReadyToMerge {
 		return "✅"
 	}
 	if pr.TurnResponse != nil {
-		for _, tag := range pr.TurnResponse.Tags {
+		for _, tag := range pr.TurnResponse.PRState.Tags {
 			switch tag {
 			case "has_approval":
 				return "👍"
@@ -802,7 +906,7 @@ func prIcon(pr PR) string {
 func coloredTag(tag string) string {
 	var color string
 	var icon string
-	
+
 	switch tag {
 	case "draft":
 		color = "#FFA500"
@@ -829,14 +933,14 @@ func coloredTag(tag string) string {
 		color = "#FF9FF3"
 		icon = "🏷️"
 	}
-	
+
 	// Create a more subtle tag style
 	style := lipgloss.NewStyle().
 		Foreground(lipgloss.Color(color)).
 		Bold(false).
 		Padding(0, 1).
 		Background(lipgloss.Color("#1a1a1a"))
-	
+
 	return style.Render(fmt.Sprintf("%s %s", icon, tag))
 }
 
@@ -867,7 +971,7 @@ func truncateURL(url string, maxLen int) string {
 	if len(url) <= maxLen {
 		return url
 	}
-	
+
 	// Keep the important parts of GitHub URLs
 	parts := strings.Split(url, "/")
 	if len(parts) >= 6 && strings.Contains(url, "github.com") {
@@ -881,7 +985,7 @@ func truncateURL(url string, maxLen int) string {
 			return shortened
 		}
 	}
-	
+
 	// Fallback to regular truncation
 	return truncate(url, maxLen)
 }
