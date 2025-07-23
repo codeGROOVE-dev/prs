@@ -191,6 +191,7 @@ func main() {
 		watchInterval = flag.Duration("watch-interval", defaultWatchInterval, "Watch interval (default: 90s)")
 		blocked       = flag.Bool("blocked", false, "Show only PRs blocking on you")
 		notify        = flag.Bool("notify", false, "Watch for PRs and notify when they become newly blocking")
+		bell          = flag.Bool("bell", true, "Ring ASCII bell when new PRs are found in notify mode")
 		turnServer    = flag.String("turn-server", defaultTurnServerURL, "Turn server URL for enhanced metadata")
 		org           = flag.String("org", "", "Filter PRs to specific organization")
 		includeStale  = flag.Bool("include-stale", false, "Include stale PRs in the output")
@@ -279,7 +280,7 @@ func main() {
 
 	// If either watch or notify is set, run in watch mode
 	if *watch || *notify {
-		runWatchMode(ctx, token, username, *blocked, *notify, *watchInterval, logger, httpClient, turnClient, debug, *org, *includeStale)
+		runWatchMode(ctx, token, username, *blocked, *notify, *bell, *watchInterval, logger, httpClient, turnClient, debug, *org, *includeStale)
 	} else {
 		// One-time display
 		prs, err := fetchPRsWithRetry(ctx, token, username, logger, httpClient, turnClient, debug, *org)
@@ -1011,7 +1012,7 @@ func truncateURL(url string, maxLen int) string {
 	return truncate(url, maxLen)
 }
 
-func runWatchMode(ctx context.Context, token, username string, blockingOnly bool, notifyMode bool, interval time.Duration, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, debug bool, org string, includeStale bool) {
+func runWatchMode(ctx context.Context, token, username string, blockingOnly bool, notifyMode bool, bell bool, interval time.Duration, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, debug bool, org string, includeStale bool) {
 	// Clear screen only if not in notify mode
 	if !notifyMode {
 		fmt.Print("\033[H\033[2J")
@@ -1086,6 +1087,9 @@ func runWatchMode(ctx context.Context, token, username string, blockingOnly bool
 						}
 					}
 					for _, pr := range newBlockingPRs {
+						if bell {
+							fmt.Print("\a") // ASCII bell for attention
+						}
 						displayPR(pr, username)
 					}
 				} else {
@@ -1098,6 +1102,9 @@ func runWatchMode(ctx context.Context, token, username string, blockingOnly bool
 						}
 					}
 					for _, pr := range newPRs {
+						if bell {
+							fmt.Print("\a") // ASCII bell for attention
+						}
 						displayPR(pr, username)
 					}
 				}

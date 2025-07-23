@@ -46,6 +46,7 @@ prs --notify
 - `--include-stale` - Include old PRs (hidden by default)
 - `--watch` - Live updates
 - `--notify` - Desktop notifications
+- `--bell` - Ring ASCII bell for new PRs in notify mode (default: true)
 - `--org` - Filter to specific organization
 - `--debug` - Show debug info
 
