@@ -37,7 +37,7 @@ prs --notify
 ### Default View (`prs`)
 ![Default View](media/default.png)
 
-### Focus Mode (`prs --blocked`)
+### Live Focus Mode (`prs --blocked --watch`)
 ![Watch Blocked View](media/watch_blocked.png)
 
 ## Options
