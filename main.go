@@ -193,6 +193,7 @@ func main() {
 		notify        = flag.Bool("notify", false, "Watch for PRs and notify when they become newly blocking")
 		turnServer    = flag.String("turn-server", defaultTurnServerURL, "Turn server URL for enhanced metadata")
 		org           = flag.String("org", "", "Filter PRs to specific organization")
+		includeStale  = flag.Bool("include-stale", false, "Include stale PRs in the output")
 		debug         bool
 	)
 	flag.BoolVar(&debug, "debug", false, "Show debug information including API calls and turnclient data")
@@ -278,7 +279,7 @@ func main() {
 
 	// If either watch or notify is set, run in watch mode
 	if *watch || *notify {
-		runWatchMode(ctx, token, username, *blocked, *notify, *watchInterval, logger, httpClient, turnClient, debug, *org)
+		runWatchMode(ctx, token, username, *blocked, *notify, *watchInterval, logger, httpClient, turnClient, debug, *org, *includeStale)
 	} else {
 		// One-time display
 		prs, err := fetchPRsWithRetry(ctx, token, username, logger, httpClient, turnClient, debug, *org)
@@ -290,7 +291,7 @@ func main() {
 			}
 			os.Exit(1)
 		}
-		displayPRs(prs, username, *blocked, debug)
+		displayPRs(prs, username, *blocked, debug, *includeStale)
 	}
 }
 
@@ -707,7 +708,27 @@ func isBlockingOnUser(pr PR, username string) bool {
 	return false
 }
 
-func displayPRs(prs []PR, username string, blockingOnly bool, debug bool) {
+func displayPRs(prs []PR, username string, blockingOnly bool, debug bool, includeStale bool) {
+	// Filter out stale PRs unless includeStale is true
+	if !includeStale {
+		var filteredPRs []PR
+		for _, pr := range prs {
+			isStale := false
+			if pr.TurnResponse != nil {
+				for _, tag := range pr.TurnResponse.PRState.Tags {
+					if tag == "stale" {
+						isStale = true
+						break
+					}
+				}
+			}
+			if !isStale {
+				filteredPRs = append(filteredPRs, pr)
+			}
+		}
+		prs = filteredPRs
+	}
+
 	incoming, outgoing := categorizePRs(prs, username)
 	blockingCount := countBlockingPRs(incoming, username, debug)
 
@@ -990,7 +1011,7 @@ func truncateURL(url string, maxLen int) string {
 	return truncate(url, maxLen)
 }
 
-func runWatchMode(ctx context.Context, token, username string, blockingOnly bool, notifyMode bool, interval time.Duration, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, debug bool, org string) {
+func runWatchMode(ctx context.Context, token, username string, blockingOnly bool, notifyMode bool, interval time.Duration, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, debug bool, org string, includeStale bool) {
 	// Clear screen only if not in notify mode
 	if !notifyMode {
 		fmt.Print("\033[H\033[2J")
@@ -1013,7 +1034,7 @@ func runWatchMode(ctx context.Context, token, username string, blockingOnly bool
 			header := "🔄 Live PR Dashboard - Press 'q' to quit"
 			fmt.Println(titleStyle.Render(header))
 			fmt.Println()
-			displayPRs(prs, username, blockingOnly, debug)
+			displayPRs(prs, username, blockingOnly, debug, includeStale)
 		}
 	}
 
@@ -1049,7 +1070,7 @@ func runWatchMode(ctx context.Context, token, username string, blockingOnly bool
 				header := "🔄 Live PR Dashboard - Press 'q' to quit"
 				fmt.Println(titleStyle.Render(header))
 				fmt.Println()
-				displayPRs(prs, username, blockingOnly, debug)
+				displayPRs(prs, username, blockingOnly, debug, includeStale)
 			}
 			// In notify mode, don't clear screen - just show new PRs below
 

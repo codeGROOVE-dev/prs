@@ -1,62 +1,66 @@
 # 🚀 prs
 
-> Only shows PRs waiting on YOU - preserving your focus time and sanity
+> Only shows PRs waiting on YOU
 
-A blazingly fast CLI tool that filters out all the noise to show only the PRs that need your action. No more context switching through dozens of PRs that don't need you right now.
+A fast CLI that filters GitHub PRs to show only what needs your attention. No more digging through dozens of PRs to find the ones that actually need you.
 
 ## Quick Start
 
 ```bash
 go install github.com/ready-to-review/prs@latest
+prs
 ```
 
-**Prerequisites:** Go 1.23+ and GitHub CLI (`gh`) authenticated
+**Requirements:** Go 1.23+ and GitHub CLI (`gh`) authenticated
 
 ## Usage
 
 ```bash
-# The default - shows ONLY PRs waiting on your input
+# Show PRs you're involved with (filters out stale PRs)
 prs
 
-# See everything you're involved with (if you really want to)
-prs --all
+# Only PRs waiting for your review
+prs --blocked
 
-# Stay focused - auto-refresh what needs your attention (every 10 min)
+# Include old/stale PRs
+prs --include-stale
+
+# Auto-refresh view
 prs --watch
 
-# Get alerted to newly blocking PRs (notifications currently unavailable)
+# Get notified when PRs need attention
 prs --notify
 ```
 
 ## What You'll See
 
-```
-🔥 2 PRs awaiting your review
+### Default View (`prs`)
+![Default View](media/default.png)
 
-⬇️  Incoming PRs
-
-  ● 🚧 Fix authentication bug ⚡
-     3h • https://github.com/org/repo/pull/123
-
-  ● ✅ Add user preferences
-     1d • https://github.com/org/repo/pull/456
-
-⬆️  Your PRs
-
-  ● 📝 Update documentation
-     2h • https://github.com/org/repo/pull/789
-```
+### Focus Mode (`prs --blocked`)
+![Watch Blocked View](media/watch_blocked.png)
 
 ## Options
 
-- `--all` - Show all your PRs, not just review requests
-- `--watch` - Keep watching for updates (10 min intervals)
-- `--watch-interval N` - Customize refresh rate (minutes)
-- `--notify` - New PR alerts (⚠️ currently disabled)
-- `--verbose` - Debug mode for the curious
+- `--blocked` - Only PRs blocking on you
+- `--include-stale` - Include old PRs (hidden by default)
+- `--watch` - Live updates
+- `--notify` - Desktop notifications
+- `--org` - Filter to specific organization
+- `--debug` - Show debug info
 
-## Why This Exists
+## Status Icons
 
-**Focus is precious.** This tool shows ONLY the PRs blocked on your input - nothing else. No PRs waiting on CI, no PRs waiting on other reviewers, no PRs you've already reviewed. Just the ones that need you, right now.
+- 🚧 Draft PR
+- ✅ Ready to merge
+- 👍 Has approval
+- 💥 Merge conflict
+- ⏰ Stale PR
+- ❌ Failing tests
+- 📝 Regular PR
 
-Built with Go for speed, because waiting for your tools is another focus killer.
+## Why This Tool?
+
+Stop context switching through GitHub tabs. This tool uses smart filtering to show only PRs that actually need your input - not PRs waiting on CI, other reviewers, or ones you've already reviewed.
+
+Built fast in Go because your development tools shouldn't slow you down.
