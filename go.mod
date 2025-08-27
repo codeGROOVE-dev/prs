@@ -1,4 +1,4 @@
-module github.com/ready-to-review/prs
+module github.com/codeGROOVE-dev/prs
 
 go 1.23.4
 

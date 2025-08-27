@@ -2,46 +2,7 @@ package main
 
 import (
 	"testing"
-	"time"
 )
-
-func TestFormatAge(t *testing.T) {
-	tests := []struct {
-		name     string
-		time     time.Time
-		expected string
-	}{
-		{
-			name:     "minutes",
-			time:     time.Now().Add(-30 * time.Minute),
-			expected: "30m",
-		},
-		{
-			name:     "hours",
-			time:     time.Now().Add(-5 * time.Hour),
-			expected: "5h",
-		},
-		{
-			name:     "days",
-			time:     time.Now().Add(-3 * 24 * time.Hour),
-			expected: "3d",
-		},
-		{
-			name:     "weeks",
-			time:     time.Now().Add(-14 * 24 * time.Hour),
-			expected: "2w",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := formatAge(tt.time)
-			if got != tt.expected {
-				t.Errorf("formatAge() = %v, want %v", got, tt.expected)
-			}
-		})
-	}
-}
 
 func TestTruncate(t *testing.T) {
 	tests := []struct {
@@ -198,5 +159,90 @@ func TestWasBlockingBefore(t *testing.T) {
 				t.Errorf("wasBlockingBefore() = %v, want %v", got, tt.expected)
 			}
 		})
+	}
+}
+
+func TestOrgFromURL(t *testing.T) {
+	tests := []struct {
+		name     string
+		url      string
+		expected string
+	}{
+		{
+			name:     "valid github PR URL",
+			url:      "https://github.com/owner/repo/pull/123",
+			expected: "owner",
+		},
+		{
+			name:     "valid github issue URL",
+			url:      "https://github.com/org/project/issues/456",
+			expected: "org",
+		},
+		{
+			name:     "non-github URL",
+			url:      "https://example.com/something/else",
+			expected: "",
+		},
+		{
+			name:     "malformed URL",
+			url:      "not-a-url",
+			expected: "",
+		},
+		{
+			name:     "github URL with too few parts",
+			url:      "https://github.com/",
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := orgFromURL(tt.url)
+			if got != tt.expected {
+				t.Errorf("orgFromURL(%q) = %q, want %q", tt.url, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestCategorizePRs(t *testing.T) {
+	prs := []PR{
+		{
+			Number: 1,
+			User:   User{Login: "alice"},
+		},
+		{
+			Number: 2,
+			User:   User{Login: "bob"},
+		},
+		{
+			Number: 3,
+			User:   User{Login: "alice"},
+		},
+		{
+			Number: 4,
+			User:   User{Login: "charlie"},
+		},
+	}
+
+	incoming, outgoing := categorizePRs(prs, "alice")
+
+	if len(outgoing) != 2 {
+		t.Errorf("Expected 2 outgoing PRs, got %d", len(outgoing))
+	}
+	if len(incoming) != 2 {
+		t.Errorf("Expected 2 incoming PRs, got %d", len(incoming))
+	}
+
+	// Verify correct categorization
+	for _, pr := range outgoing {
+		if pr.User.Login != "alice" {
+			t.Errorf("Outgoing PR has wrong author: %s", pr.User.Login)
+		}
+	}
+	for _, pr := range incoming {
+		if pr.User.Login == "alice" {
+			t.Errorf("Incoming PR has wrong author: %s", pr.User.Login)
+		}
 	}
 }
