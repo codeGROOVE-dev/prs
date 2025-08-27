@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -24,6 +23,7 @@ import (
 
 	"github.com/avast/retry-go/v4"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/codeGROOVE-dev/sprinkler/pkg/client"
 	"github.com/ready-to-review/turnclient/pkg/turn"
 )
 
@@ -75,56 +75,88 @@ type cacheEntry struct {
 	Timestamp time.Time           `json:"timestamp"`
 }
 
+// prRefreshTracker tracks the last refresh time for PRs to avoid duplicate API calls.
+type prRefreshTracker struct {
+	lastRefresh map[string]time.Time
+	mu          sync.RWMutex
+}
+
+func newPRRefreshTracker() *prRefreshTracker {
+	return &prRefreshTracker{
+		lastRefresh: make(map[string]time.Time),
+	}
+}
+
+func (t *prRefreshTracker) shouldRefresh(prURL string) bool {
+	t.mu.RLock()
+	lastTime, exists := t.lastRefresh[prURL]
+	t.mu.RUnlock()
+	
+	if !exists {
+		return true
+	}
+	
+	return time.Since(lastTime) > time.Duration(prRefreshCooldownSecs)*time.Second
+}
+
+func (t *prRefreshTracker) markRefreshed(prURL string) {
+	t.mu.Lock()
+	t.lastRefresh[prURL] = time.Now()
+	t.mu.Unlock()
+}
+
 const (
-	defaultTimeout       = 30 * time.Second
-	defaultWatchInterval = 90 * time.Second
-	maxPerPage           = 100
-	retryAttempts        = 3
-	retryDelay           = time.Second
-	retryMaxDelay        = 10 * time.Second
-	enrichRetries        = 2
-	enrichDelay          = 500 * time.Millisecond
-	enrichMaxDelay       = 2 * time.Second
-	apiUserEndpoint      = "https://api.github.com/user"
-	apiSearchEndpoint    = "https://api.github.com/search/issues"
-	apiPullsEndpoint     = "https://api.github.com/repos/%s/%s/pulls/%d"
-	defaultTurnServerURL = "https://turn.ready-to-review.dev"
-	maxConcurrent        = 20            // Increased for better throughput
-	cacheTTL             = 2 * time.Hour // 2 hours
+	defaultTimeout         = 30 * time.Second
+	defaultWatchInterval   = 90 * time.Second
+	maxPerPage             = 100
+	retryAttempts          = 3
+	retryDelay             = time.Second
+	retryMaxDelay          = 10 * time.Second
+	enrichRetries          = 2
+	enrichDelay            = 500 * time.Millisecond
+	enrichMaxDelay         = 2 * time.Second
+	apiUserEndpoint        = "https://api.github.com/user"
+	apiSearchEndpoint      = "https://api.github.com/search/issues"
+	apiPullsEndpoint       = "https://api.github.com/repos/%s/%s/pulls/%d"
+	defaultTurnServerURL   = "https://turn.ready-to-review.dev"
+	defaultSprinklerURL    = "wss://hook.g.robot-army.dev/ws"
+	maxConcurrent          = 20            // Increased for better throughput
+	cacheTTL               = 2 * time.Hour // 2 hours
+	prRefreshCooldownSecs  = 1             // Avoid refreshing same PR within 1 second
 )
 
-// Style definitions.
+// Style definitions - modern minimalist palette
 var (
+	// Modern palette inspired by Vercel/Linear design
 	titleStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FF6B6B")).
-			Bold(true).
-			Underline(true)
-
-	headerStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#4ECDC4")).
-			Bold(true).
-			Padding(0, 1)
-
-	prTitleStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#45B7D1")).
+			Foreground(lipgloss.Color("#E5484D")). // Modern red
 			Bold(true)
 
+	headerStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#8B8B8B")). // Neutral gray
+			Bold(false)
+
+	prTitleStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FAFAFA")). // Almost white
+			Bold(false)
+
 	ageStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#96CEB4"))
+			Foreground(lipgloss.Color("#666666")).
+			Italic(true)
 
 	urlStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FECA57")).
+			Foreground(lipgloss.Color("#3E63DD")). // Modern blue
 			Underline(true)
 
 	tagStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FF9FF3")).
-			Bold(true)
+			Foreground(lipgloss.Color("#8B8B8B")).
+			Bold(false)
 
 	infoStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#54A0FF"))
+			Foreground(lipgloss.Color("#8B8B8B")) // Neutral gray
 
 	successStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#5F27CD")).
+			Foreground(lipgloss.Color("#30A46C")). // Modern green
 			Bold(true)
 )
 
@@ -187,31 +219,17 @@ func saveTurnCache(path string, response *turn.CheckResponse) {
 
 func main() {
 	var (
-		watch         = flag.Bool("watch", false, "Continuously watch for PR updates")
-		watchInterval = flag.Duration("watch-interval", defaultWatchInterval, "Watch interval (default: 90s)")
-		blocked       = flag.Bool("blocked", false, "Show only PRs blocking on you")
-		notify        = flag.Bool("notify", false, "Watch for PRs and notify when they become newly blocking")
-		bell          = flag.Bool("bell", true, "Ring ASCII bell when new PRs are found in notify mode")
-		turnServer    = flag.String("turn-server", defaultTurnServerURL, "Turn server URL for enhanced metadata")
-		org           = flag.String("org", "", "Filter PRs to specific organization")
-		includeStale  = flag.Bool("include-stale", false, "Include stale PRs in the output")
-		debug         bool
+		watch        = flag.Bool("watch", false, "Continuously watch for PR updates")
+		blocked      = flag.Bool("blocked", false, "Show only PRs blocking on you")
+		verbose      = flag.Bool("verbose", false, "Show verbose logging from libraries")
+		excludeOrgs  = flag.String("exclude-orgs", "", "Comma-separated list of orgs to exclude")
+		includeStale = flag.Bool("include-stale", false, "Include PRs that haven't been modified in 90 days")
 	)
-	flag.BoolVar(&debug, "debug", false, "Show debug information including API calls and turnclient data")
 	flag.Parse()
-
-	// Validate org parameter to prevent injection
-	if *org != "" {
-		// Allow only alphanumeric, dash, and underscore (GitHub org naming rules)
-		if !isValidOrgName(*org) {
-			fmt.Fprintf(os.Stderr, "error: invalid organization name\n")
-			os.Exit(1)
-		}
-	}
 
 	// Set up logger
 	var logger *log.Logger
-	if debug {
+	if *verbose {
 		logger = log.New(os.Stderr, "[github-pr-notifier] ", log.Ltime)
 	} else {
 		logger = log.New(io.Discard, "", 0)
@@ -246,22 +264,19 @@ func main() {
 	}
 	logger.Printf("INFO: Authenticated as user: %s", username)
 
-	// Set up turn client if turn server is specified
+	// Set up turn client
 	var turnClient *turn.Client
-	if *turnServer != "" {
-		turnClient, err = turn.NewClient(*turnServer)
-		if err != nil {
-			logger.Printf("ERROR: Failed to create turn client for %s: %v", *turnServer, err)
-			fmt.Fprintf(os.Stderr, "warning: failed to connect to turn server\n")
-			turnClient = nil
-		} else {
-			logger.Printf("INFO: Connected to turn server at %s", *turnServer)
-			if debug {
-				turnClient.SetLogger(logger)
-			}
-			if token != "" {
-				turnClient.SetAuthToken(token)
-			}
+	turnClient, err = turn.NewClient(defaultTurnServerURL)
+	if err != nil {
+		logger.Printf("ERROR: Failed to create turn client: %v", err)
+		turnClient = nil
+	} else {
+		logger.Printf("INFO: Connected to turn server")
+		if *verbose {
+			turnClient.SetLogger(logger)
+		}
+		if token != "" {
+			turnClient.SetAuthToken(token)
 		}
 	}
 
@@ -278,12 +293,21 @@ func main() {
 		cancel()
 	}()
 
-	// If either watch or notify is set, run in watch mode
-	if *watch || *notify {
-		runWatchMode(ctx, token, username, *blocked, *notify, *bell, *watchInterval, logger, httpClient, turnClient, debug, *org, *includeStale)
+	// Parse excluded orgs
+	var excludedOrgs []string
+	if *excludeOrgs != "" {
+		excludedOrgs = strings.Split(*excludeOrgs, ",")
+		for i := range excludedOrgs {
+			excludedOrgs[i] = strings.TrimSpace(excludedOrgs[i])
+		}
+	}
+	
+	if *watch {
+		// Watch mode: hybrid WebSocket + polling with smart display updates
+		runWatchMode(ctx, token, username, *blocked, *verbose, *includeStale, logger, httpClient, turnClient, excludedOrgs)
 	} else {
-		// One-time display
-		prs, err := fetchPRsWithRetry(ctx, token, username, logger, httpClient, turnClient, debug, *org)
+		// Default: one-time display
+		prs, err := fetchPRsWithRetry(ctx, token, username, logger, httpClient, turnClient, *verbose, "")
 		if err != nil {
 			if err == context.Canceled {
 				fmt.Fprintf(os.Stderr, "\nOperation cancelled\n")
@@ -292,7 +316,10 @@ func main() {
 			}
 			os.Exit(1)
 		}
-		displayPRs(prs, username, *blocked, debug, *includeStale)
+		output := generatePRDisplay(prs, username, *blocked, *verbose, *includeStale, excludedOrgs)
+		if output != "" {
+			fmt.Print(output)
+		}
 	}
 }
 
@@ -709,46 +736,6 @@ func isBlockingOnUser(pr PR, username string) bool {
 	return false
 }
 
-func displayPRs(prs []PR, username string, blockingOnly bool, debug bool, includeStale bool) {
-	// Filter out stale PRs unless includeStale is true
-	if !includeStale {
-		var filteredPRs []PR
-		for _, pr := range prs {
-			isStale := false
-			if pr.TurnResponse != nil {
-				for _, tag := range pr.TurnResponse.PRState.Tags {
-					if tag == "stale" {
-						isStale = true
-						break
-					}
-				}
-			}
-			if !isStale {
-				filteredPRs = append(filteredPRs, pr)
-			}
-		}
-		prs = filteredPRs
-	}
-
-	incoming, outgoing := categorizePRs(prs, username)
-	blockingCount := countBlockingPRs(incoming, username, debug)
-
-	displayHeader(blockingOnly, blockingCount, len(incoming), len(outgoing))
-
-	if len(incoming) > 0 && (!blockingOnly || blockingCount > 0) {
-		displayIncomingPRs(incoming, username, blockingOnly)
-	}
-
-	if len(outgoing) > 0 && !blockingOnly {
-		displayOutgoingPRs(outgoing, username)
-	}
-
-	if blockingOnly && blockingCount == 0 {
-		fmt.Print("\n")
-		fmt.Println(successStyle.Render("✨ No PRs awaiting your review - you're all caught up!"))
-	}
-	fmt.Print("\n")
-}
 
 func categorizePRs(prs []PR, username string) (incoming, outgoing []PR) {
 	for _, pr := range prs {
@@ -787,143 +774,9 @@ func debugPR(pr PR, username string) {
 	}
 }
 
-func displayHeader(blockingOnly bool, blockingCount, incomingCount, outgoingCount int) {
-	fmt.Print("\n")
-	if blockingOnly && blockingCount > 0 {
-		plural := ""
-		if blockingCount != 1 {
-			plural = "s"
-		}
-		header := fmt.Sprintf("🔥 %d PR%s awaiting your review", blockingCount, plural)
-		fmt.Println(titleStyle.Render(header))
-	} else if !blockingOnly {
-		fmt.Println(titleStyle.Render("📋 Pull Request Dashboard"))
 
-		totalPRs := incomingCount + outgoingCount
-		summaryText := fmt.Sprintf("📊 %d total PR%s • %d incoming • %d outgoing • %d blocking you",
-			totalPRs, func() string {
-				if totalPRs == 1 {
-					return ""
-				}
-				return "s"
-			}(), incomingCount, outgoingCount, blockingCount)
-		fmt.Println(infoStyle.Render(summaryText))
-	}
-}
 
-func displayIncomingPRs(incoming []PR, username string, blockingOnly bool) {
-	// Count PRs that will actually be displayed
-	displayCount := 0
-	for _, pr := range incoming {
-		if !blockingOnly || isBlockingOnUser(pr, username) {
-			displayCount++
-		}
-	}
 
-	// Only show header if there are PRs to display
-	if displayCount > 0 {
-		fmt.Print("\n")
-		fmt.Println(headerStyle.Render("⬇️  Incoming PRs"))
-		fmt.Print("\n")
-	}
-
-	for _, pr := range incoming {
-		if blockingOnly && !isBlockingOnUser(pr, username) {
-			continue
-		}
-		displayPR(pr, username)
-	}
-}
-
-func displayOutgoingPRs(outgoing []PR, username string) {
-	fmt.Print("\n")
-	fmt.Println(headerStyle.Render("⬆️  Your PRs"))
-	fmt.Print("\n")
-	for _, pr := range outgoing {
-		displayPR(pr, username)
-	}
-}
-
-func displayPR(pr PR, username string) {
-	// Format age
-	age := formatAge(pr.UpdatedAt)
-
-	// Get PR icon based on status
-	icon := prIcon(pr)
-
-	// Prepare tags display with colors
-	var tagsDisplay string
-	if pr.TurnResponse != nil && len(pr.TurnResponse.PRState.Tags) > 0 {
-		var coloredTags []string
-		for _, tag := range pr.TurnResponse.PRState.Tags {
-			coloredTags = append(coloredTags, coloredTag(tag))
-		}
-		tagsDisplay = fmt.Sprintf(" %s", strings.Join(coloredTags, " "))
-	}
-
-	// Create styled components
-	var bulletColor string
-	if isBlockingOnUser(pr, username) {
-		bulletColor = "#FF0000" // Intense red for blocked PRs
-	} else {
-		bulletColor = "#FF79C6" // Pink for regular PRs
-	}
-	bullet := lipgloss.NewStyle().Foreground(lipgloss.Color(bulletColor)).Render("●")
-	prIcon := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF79C6")).Render(icon)
-	title := prTitleStyle.Render(truncate(pr.Title, 60))
-	ageFormatted := ageStyle.Render(age)
-	url := urlStyle.Render(truncateURL(pr.HTMLURL, 80))
-
-	// Create the main PR line with bullet
-	prLine := fmt.Sprintf("  %s %s %s", bullet, prIcon, title)
-
-	// Add blocking indicator if user is blocked
-	if isBlockingOnUser(pr, username) {
-		blockingIndicator := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FF5555")).
-			Bold(true).
-			Render(" ⚡")
-		prLine += blockingIndicator
-	}
-
-	// Create size display
-	var sizeDisplay string
-	if pr.Additions > 0 || pr.Deletions > 0 || pr.ChangedFiles > 0 {
-		sizeDisplay = fmt.Sprintf(" +%d/-%d (%d files)", pr.Additions, pr.Deletions, pr.ChangedFiles)
-	}
-
-	// Create info line with indentation
-	infoLine := fmt.Sprintf("     %s • %s%s%s", ageFormatted, url, sizeDisplay, tagsDisplay)
-
-	// Print with nice spacing
-	fmt.Println(prLine)
-	fmt.Println(infoLine)
-	fmt.Println()
-}
-
-func prIcon(pr PR) string {
-	if pr.Draft {
-		return "🚧"
-	}
-	if pr.TurnResponse != nil && pr.TurnResponse.PRState.ReadyToMerge {
-		return "✅"
-	}
-	if pr.TurnResponse != nil {
-		for _, tag := range pr.TurnResponse.PRState.Tags {
-			switch tag {
-			case "has_approval":
-				return "👍"
-			case "merge_conflict":
-				return "💥"
-			case "stale":
-				return "⏰"
-			case "failing_tests":
-				return "❌"
-			}
-		}
-	}
-	return "📝"
-}
 
 func coloredTag(tag string) string {
 	var color string
@@ -1012,125 +865,490 @@ func truncateURL(url string, maxLen int) string {
 	return truncate(url, maxLen)
 }
 
-func runWatchMode(ctx context.Context, token, username string, blockingOnly bool, notifyMode bool, bell bool, interval time.Duration, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, debug bool, org string, includeStale bool) {
-	// Clear screen only if not in notify mode
-	if !notifyMode {
-		fmt.Print("\033[H\033[2J")
+// Helper functions for enhanced display
+
+func getAgeColor(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < 24*time.Hour:
+		return "#00FF88" // Fresh - bright green
+	case d < 3*24*time.Hour:
+		return "#00BCD4" // Recent - cyan
+	case d < 7*24*time.Hour:
+		return "#FFC107" // Week old - amber
+	case d < 30*24*time.Hour:
+		return "#FF9800" // Month old - orange
+	default:
+		return "#FF5722" // Old - deep orange
 	}
+}
 
-	var lastPRs []PR
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+func getSizeIndicator(additions, deletions, files int) string {
+	total := additions + deletions
+	
+	// Visual size indicator
+	var size string
+	var color string
+	
+	switch {
+	case total < 10:
+		size = "●"
+		color = "#00E676"
+	case total < 50:
+		size = "●●"
+		color = "#FFC107"
+	case total < 200:
+		size = "●●●"
+		color = "#FF9800"
+	case total < 500:
+		size = "●●●●"
+		color = "#FF5722"
+	default:
+		size = "●●●●●"
+		color = "#FF1744"
+	}
+	
+	return lipgloss.NewStyle().
+		Foreground(lipgloss.Color(color)).
+		Render(size)
+}
 
-	// Initial fetch and display (unless notify-only mode)
-	prs, err := fetchPRsWithRetry(ctx, token, username, logger, httpClient, turnClient, debug, org)
-	if err != nil {
-		if err != context.Canceled {
-			fmt.Fprintf(os.Stderr, "Error fetching PRs: %v\n", err)
+func getMinimalTag(tag string) string {
+	var symbol string
+	var color string
+	
+	switch tag {
+	case "has_approval":
+		symbol = "✓"
+		color = "#00E676"
+	case "merge_conflict":
+		symbol = "✗"
+		color = "#FF1744"
+	case "stale":
+		symbol = "◔"
+		color = "#666666"
+	case "failing_tests":
+		symbol = "⚠"
+		color = "#FFC107"
+	case "ready_to_merge":
+		symbol = "→"
+		color = "#00FF88"
+	default:
+		return ""
+	}
+	
+	return lipgloss.NewStyle().
+		Foreground(lipgloss.Color(color)).
+		Render(symbol)
+}
+
+func shortenRepo(url string) string {
+	// Extract just owner/repo from GitHub URL
+	parts := strings.Split(url, "/")
+	if len(parts) >= 6 && strings.Contains(url, "github.com") {
+		owner := parts[3]
+		repo := parts[4]
+		number := parts[6]
+		
+		// Shorten long repo names
+		if len(owner) > 15 {
+			owner = owner[:12] + "..."
 		}
-	} else {
-		// In notify mode, don't set lastPRs initially - start fresh
-		if !notifyMode {
-			lastPRs = prs
-			header := "🔄 Live PR Dashboard - Press 'q' to quit"
-			fmt.Println(titleStyle.Render(header))
-			fmt.Println()
-			displayPRs(prs, username, blockingOnly, debug, includeStale)
+		if len(repo) > 20 {
+			repo = repo[:17] + "..."
+		}
+		
+		return fmt.Sprintf("%s/%s#%s", owner, repo, number)
+	}
+	return url
+}
+
+func getOrgFromURL(url string) string {
+	// Extract org/owner from GitHub URL
+	parts := strings.Split(url, "/")
+	if len(parts) >= 4 && strings.Contains(url, "github.com") {
+		return parts[3] // This is the org/owner
+	}
+	return ""
+}
+
+// sortPRsByUpdateTime sorts PRs by most recently updated first
+func sortPRsByUpdateTime(prs []PR) {
+	for i := 0; i < len(prs); i++ {
+		for j := i + 1; j < len(prs); j++ {
+			if prs[j].UpdatedAt.After(prs[i].UpdatedAt) {
+				prs[i], prs[j] = prs[j], prs[i]
+			}
 		}
 	}
+}
 
-	// Set up interrupt handler
-	quitCh := make(chan bool)
+
+
+// runHybridMode runs the application with both WebSocket and polling for maximum coverage
+// runWatchMode runs the simplified watch mode with WebSocket + polling and smart display updates
+func runWatchMode(ctx context.Context, token, username string, blockingOnly bool, verbose bool, includeStale bool, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, excludedOrgs []string) {
+	logger.Printf("Starting watch mode with WebSocket + polling")
+	
+	// Track last displayed output to detect changes
+	var lastDisplayHash string
+	
+	// Create refresh tracker to prevent duplicate API calls
+	refreshTracker := newPRRefreshTracker()
+	
+	// Channel to trigger display updates
+	updateChan := make(chan bool, 10)
+	
+	// Initial display
+	if err := updateDisplay(ctx, token, username, blockingOnly, verbose, includeStale, logger, httpClient, turnClient, &lastDisplayHash, true, excludedOrgs); err != nil {
+		logger.Printf("ERROR: Initial display failed: %v", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	
+	// Start WebSocket monitoring
 	go func() {
-		scanner := bufio.NewScanner(os.Stdin)
-		for scanner.Scan() {
-			if scanner.Text() == "q" {
-				quitCh <- true
+		// Redirect standard log output to discard when not verbose
+		// This suppresses sprinkler library logs
+		if !verbose {
+			log.SetOutput(io.Discard)
+			defer log.SetOutput(os.Stderr) // Restore on exit
+		}
+		
+		config := client.Config{
+			ServerURL:      defaultSprinklerURL,
+			Token:          token,
+			Organization:   "*",
+			EventTypes:     []string{"*"}, 
+			UserEventsOnly: false,
+			Verbose:        verbose,
+			NoReconnect:    false,
+			OnConnect: func() {
+				logger.Println("✓ WebSocket connected")
+			},
+			OnDisconnect: func(err error) {
+				logger.Printf("WebSocket disconnected: %v", err)
+			},
+			OnEvent: func(event client.Event) {
+				if event.Type == "pull_request" && event.URL != "" {
+					if refreshTracker.shouldRefresh(event.URL) {
+						refreshTracker.markRefreshed(event.URL)
+						logger.Printf("WebSocket event: %s", event.URL)
+						select {
+						case updateChan <- true:
+						default: // Don't block if channel is full
+						}
+					}
+				}
+			},
+		}
+		
+		wsClient, err := client.New(config)
+		if err != nil {
+			logger.Printf("WARNING: Failed to create WebSocket client: %v", err)
+			return
+		}
+		
+		if err := wsClient.Start(ctx); err != nil && err != context.Canceled {
+			logger.Printf("WARNING: WebSocket client error: %v", err)
+		}
+	}()
+	
+	// Start polling
+	go func() {
+		ticker := time.NewTicker(defaultWatchInterval)
+		defer ticker.Stop()
+		
+		for {
+			select {
+			case <-ctx.Done():
 				return
+			case <-ticker.C:
+				logger.Printf("Polling update")
+				select {
+				case updateChan <- true:
+				default: // Don't block if channel is full
+				}
 			}
 		}
 	}()
-
+	
+	// Main update loop
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("\nShutting down...")
 			return
-		case <-ticker.C:
-			prs, err := fetchPRsWithRetry(ctx, token, username, logger, httpClient, turnClient, debug, org)
-			if err != nil {
-				if err != context.Canceled {
-					fmt.Fprintf(os.Stderr, "Error fetching PRs: %v\n", err)
+		case <-updateChan:
+			if err := updateDisplay(ctx, token, username, blockingOnly, verbose, includeStale, logger, httpClient, turnClient, &lastDisplayHash, false, excludedOrgs); err != nil {
+				logger.Printf("ERROR: Display update failed: %v", err)
+			}
+		}
+	}
+}
+
+// updateDisplay fetches current PRs and updates the display only if content changed
+func updateDisplay(ctx context.Context, token, username string, blockingOnly bool, verbose bool, includeStale bool, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, lastHash *string, forceDisplay bool, excludedOrgs []string) error {
+	// Fetch current PRs
+	prs, err := fetchPRsWithRetry(ctx, token, username, logger, httpClient, turnClient, verbose, "")
+	if err != nil {
+		return err
+	}
+	
+	// Generate display output
+	output := generatePRDisplay(prs, username, blockingOnly, verbose, includeStale, excludedOrgs)
+	
+	// Calculate hash of the output
+	h := sha256.Sum256([]byte(output))
+	currentHash := hex.EncodeToString(h[:])
+	
+	// Only update display if content changed or forced
+	if forceDisplay || *lastHash != currentHash {
+		// Always clear screen before drawing
+		fmt.Print("\033[H\033[2J")
+		
+		if output != "" { // Only display if there's content
+			fmt.Print(output)
+			*lastHash = currentHash
+			
+			logger.Printf("Display updated (hash: %s)", currentHash[:8])
+		} else {
+			// No content to display (screen already cleared)
+			*lastHash = currentHash
+			logger.Printf("No PRs to display")
+		}
+	} else {
+		logger.Printf("No display changes detected")
+	}
+	
+	return nil
+}
+
+// generatePRDisplay creates the display output string without printing it
+func generatePRDisplay(prs []PR, username string, blockingOnly bool, verbose bool, includeStale bool, excludedOrgs []string) string {
+	var output strings.Builder
+	
+	// Filter out excluded orgs
+	if len(excludedOrgs) > 0 {
+		var filteredPRs []PR
+		for _, pr := range prs {
+			excluded := false
+			prOrg := getOrgFromURL(pr.HTMLURL)
+			for _, excludeOrg := range excludedOrgs {
+				if prOrg == excludeOrg {
+					excluded = true
+					break
 				}
+			}
+			if !excluded {
+				filteredPRs = append(filteredPRs, pr)
+			}
+		}
+		prs = filteredPRs
+	}
+	
+	// Filter out stale PRs unless includeStale is true
+	// A PR is considered stale if it hasn't been updated in 90 days
+	if !includeStale {
+		var filteredPRs []PR
+		staleCutoff := time.Now().AddDate(0, 0, -90) // 90 days ago
+		for _, pr := range prs {
+			// Keep PRs that were updated within the last 90 days
+			if pr.UpdatedAt.After(staleCutoff) {
+				filteredPRs = append(filteredPRs, pr)
+			}
+		}
+		prs = filteredPRs
+	}
+
+	incoming, outgoing := categorizePRs(prs, username)
+	
+	// Sort by most recently updated first
+	sortPRsByUpdateTime(incoming)
+	sortPRsByUpdateTime(outgoing)
+	
+	// If no PRs at all, return empty string
+	if len(incoming) == 0 && len(outgoing) == 0 {
+		return ""
+	}
+
+	// Count blocking PRs in both incoming and outgoing
+	incomingBlockingCount := 0
+	for _, pr := range incoming {
+		if isBlockingOnUser(pr, username) {
+			incomingBlockingCount++
+		}
+	}
+	
+	outgoingBlockingCount := 0
+	for _, pr := range outgoing {
+		if isBlockingOnUser(pr, username) {
+			outgoingBlockingCount++
+		}
+	}
+
+	output.WriteString("\n")
+	
+	// Incoming PRs with integrated header
+	if len(incoming) > 0 && (!blockingOnly || incomingBlockingCount > 0) {
+		// Header with counts
+		output.WriteString(headerStyle.Render(fmt.Sprintf("incoming - %d PRs", len(incoming))))
+		if incomingBlockingCount > 0 {
+			output.WriteString(headerStyle.Render(", "))
+			output.WriteString(lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#E5484D")). // Same red as bullet
+				Bold(true).
+				Render(fmt.Sprintf("%d blocked on you", incomingBlockingCount)))
+		}
+		output.WriteString(headerStyle.Render(":"))
+		output.WriteString("\n")
+
+		for _, pr := range incoming {
+			if blockingOnly && !isBlockingOnUser(pr, username) {
 				continue
 			}
-
-			// If not in notify-only mode, clear and redraw
-			if !notifyMode {
-				fmt.Print("\033[H\033[2J")
-				header := "🔄 Live PR Dashboard - Press 'q' to quit"
-				fmt.Println(titleStyle.Render(header))
-				fmt.Println()
-				displayPRs(prs, username, blockingOnly, debug, includeStale)
-			}
-			// In notify mode, don't clear screen - just show new PRs below
-
-			// Check for new PRs based on mode
-			if notifyMode {
-				if blockingOnly {
-					// Notify only for newly blocking PRs
-					// Show only newly blocking PRs with regular formatting
-					newBlockingPRs := []PR{}
-					for _, pr := range prs {
-						if isBlockingOnUser(pr, username) && !wasBlockingBefore(pr, lastPRs, username) {
-							newBlockingPRs = append(newBlockingPRs, pr)
-						}
-					}
-					for _, pr := range newBlockingPRs {
-						if bell {
-							fmt.Print("\a") // ASCII bell for attention
-						}
-						displayPR(pr, username)
-					}
-				} else {
-					// Show all new PRs with regular formatting
-					newPRs := []PR{}
-					for _, pr := range prs {
-						_, exists := findPRInList(pr, lastPRs)
-						if !exists {
-							newPRs = append(newPRs, pr)
-						}
-					}
-					for _, pr := range newPRs {
-						if bell {
-							fmt.Print("\a") // ASCII bell for attention
-						}
-						displayPR(pr, username)
-					}
-				}
-			}
-
-			lastPRs = prs
-
-		case <-quitCh:
-			fmt.Println("\nExiting...")
-			return
+			output.WriteString(formatPR(pr, username))
 		}
 	}
-}
 
-func wasBlockingBefore(pr PR, previous []PR, username string) bool {
-	if found, exists := findPRInList(pr, previous); exists {
-		return isBlockingOnUser(found, username)
-	}
-	return false
-}
-
-func findPRInList(target PR, prs []PR) (PR, bool) {
-	for _, pr := range prs {
-		if pr.Number == target.Number && pr.Repository.FullName == target.Repository.FullName {
-			return pr, true
+	// Outgoing PRs with integrated header
+	if len(outgoing) > 0 && (!blockingOnly || outgoingBlockingCount > 0) {
+		if len(incoming) > 0 {
+			output.WriteString("\n")
+		}
+		
+		// Header with counts
+		output.WriteString(headerStyle.Render(fmt.Sprintf("outgoing - %d PRs", len(outgoing))))
+		if outgoingBlockingCount > 0 {
+			output.WriteString(headerStyle.Render(", "))
+			output.WriteString(lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#E5484D")). // Same red as bullet
+				Bold(true).
+				Render(fmt.Sprintf("%d blocked on you", outgoingBlockingCount)))
+		}
+		output.WriteString(headerStyle.Render(":"))
+		output.WriteString("\n")
+		
+		for _, pr := range outgoing {
+			if blockingOnly && !isBlockingOnUser(pr, username) {
+				continue
+			}
+			output.WriteString(formatPR(pr, username))
 		}
 	}
-	return PR{}, false
+
+	if blockingOnly && incomingBlockingCount == 0 && outgoingBlockingCount == 0 {
+		// No blocking PRs - return empty string for no output
+		return ""
+	}
+	output.WriteString("\n")
+
+	return output.String()
+}
+
+// formatPR formats a single PR for display - Craigslist minimal with clickable URLs
+func formatPR(pr PR, username string) string {
+	var output strings.Builder
+	
+	// Blocking indicator - the only visual accent
+	isBlocking := isBlockingOnUser(pr, username)
+	if isBlocking {
+		output.WriteString(lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#E5484D")). // Modern red
+			Bold(true).
+			Render("• "))
+	} else {
+		output.WriteString("  ")
+	}
+	
+	// Title - truncated
+	title := pr.Title
+	if len(title) > 60 {
+		title = title[:57] + "..."
+	}
+	
+	output.WriteString(lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#FAFAFA")). // Almost white
+		Render(title))
+	output.WriteString(" ")
+	
+	// Clickable URL - full repo name, no truncation
+	output.WriteString(makeClickableURL(pr.HTMLURL))
+	
+	// Size indicator - subtle
+	if pr.Additions > 0 || pr.Deletions > 0 {
+		size := pr.Additions + pr.Deletions
+		sizeStr := ""
+		sizeColor := "#8B8B8B"
+		if size < 50 {
+			sizeStr = "s"
+			sizeColor = "#30A46C" // Green for small
+		} else if size < 200 {
+			sizeStr = "m"  
+			sizeColor = "#F5A623" // Orange for medium
+		} else if size < 500 {
+			sizeStr = "l"
+			sizeColor = "#FF8C69" // Coral for large
+		} else {
+			sizeStr = "xl"
+			sizeColor = "#E5484D" // Red for extra large
+		}
+		output.WriteString(" ")
+		output.WriteString(lipgloss.NewStyle().
+			Foreground(lipgloss.Color(sizeColor)).
+			Render(sizeStr))
+	}
+	
+	// Status tags - minimal and modern
+	if pr.TurnResponse != nil {
+		for _, tag := range pr.TurnResponse.PRState.Tags {
+			switch tag {
+			case "merge_conflict":
+				output.WriteString(" ")
+				output.WriteString(lipgloss.NewStyle().
+					Foreground(lipgloss.Color("#E5484D")). // Red
+					Render("conflict"))
+			case "ready_to_merge":
+				output.WriteString(" ")
+				output.WriteString(lipgloss.NewStyle().
+					Foreground(lipgloss.Color("#30A46C")). // Green
+					Render("ready"))
+			case "draft":
+				output.WriteString(" ")
+				output.WriteString(lipgloss.NewStyle().
+					Foreground(lipgloss.Color("#8B8B8B")). // Gray
+					Render("draft"))
+			}
+		}
+	}
+	
+	output.WriteString("\n")
+	return output.String()
+}
+
+// makeClickableURL creates a terminal hyperlink
+func makeClickableURL(url string) string {
+	// Terminal hyperlink format: \033]8;;URL\033\\LABEL\033]8;;\033\\
+	// Extract full repo path without truncation
+	label := getRepoPath(url)
+	
+	// Use OSC 8 hyperlink escape sequence
+	return fmt.Sprintf("\033]8;;%s\033\\%s\033]8;;\033\\", 
+		url,
+		lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#3E63DD")). // Modern blue
+			Underline(true).
+			Render(label))
+}
+
+// getRepoPath extracts the full repo path from a GitHub URL
+func getRepoPath(url string) string {
+	// Extract owner/repo#number from GitHub URL
+	parts := strings.Split(url, "/")
+	if len(parts) >= 7 && strings.Contains(url, "github.com") {
+		owner := parts[3]
+		repo := parts[4]
+		number := parts[6]
+		return fmt.Sprintf("%s/%s#%s", owner, repo, number)
+	}
+	return url
 }
