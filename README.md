@@ -10,7 +10,16 @@ Designed to be easily used for embedded low-power displays, or your shell initia
 go install github.com/codeGROOVE-dev/prs@latest
 ```
 
-Requires Go 1.23+ and `gh` auth.
+## Prereqs
+
+-  [go](https://go.dev/) 1.23.4 or higher
+- [gh](https://cli.github.com/) (aka, the GitHub CLI)
+
+To verify that your gh command is authenticated properly:
+
+```
+gh auth status || gh auth login
+```
 
 ## Usage
 
