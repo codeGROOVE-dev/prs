@@ -2,9 +2,13 @@
 # BEGIN: lint-install .
 # http://github.com/codeGROOVE-dev/lint-install
 
-.PHONY: lint test
+.PHONY: lint test build
 test:
 	go test -race ./...
+
+build:
+	mkdir -p out
+	go build -o out/prs .
 
 lint: _lint
 

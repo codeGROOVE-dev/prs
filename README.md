@@ -1,75 +1,46 @@
-# 🚀 prs
+# prs
 
-> Only shows PRs waiting on YOU
+GitHub PR filtering for people who don't have time for GitHub's nonsense.
 
-A fast CLI that filters GitHub PRs to show only what needs your attention. No more digging through dozens of PRs to find the ones that actually need you.
+Shows only PRs that are actually waiting on you. That's it.
 
-## Quick Start
+## Install
 
 ```bash
 go install github.com/ready-to-review/prs@latest
-prs
 ```
 
-**Requirements:** Go 1.23+ and GitHub CLI (`gh`) authenticated
+Requires Go 1.23+ and `gh` auth.
 
 ## Usage
 
 ```bash
-# Show PRs you're involved with (filters out stale PRs)
-prs
-
-# Only PRs waiting for your review
-prs --blocked
-
-# Include old/stale PRs
-prs --include-stale
-
-# Auto-refresh view
-prs --watch
-
-# Get notified when PRs need attention
-prs --notify
+prs                    # PRs you're involved with
+prs --blocked          # Only PRs waiting for you
+prs --include-stale    # Include ancient PRs
+prs --watch            # Live updates
 ```
 
-## What You'll See
-
-### Default View (`prs`)
 ![Default View](media/default.png)
 
-### Live Focus Mode (`prs --blocked --watch`)
-![Watch Blocked View](media/watch_blocked.png)
+![Watch Mode](media/watch_blocked.png)
 
-## Options
+## Flags
 
-- `--blocked` - Only PRs blocking on you
-- `--include-stale` - Include old PRs (hidden by default)
-- `--watch` - Live updates with real-time WebSocket + polling
-- `--exclude-orgs` - Comma-separated list of organizations to exclude
-- `--verbose` - Show detailed logging
-
-### Color Output
-
-Colors are automatically adjusted based on your terminal capabilities. To disable colors entirely:
-
-```bash
-NO_COLOR=1 prs
+```
+--blocked         PRs blocking on you
+--include-stale   Show old garbage too
+--watch           Real-time updates via WebSocket
+--exclude-orgs    Skip organizations (comma-separated)
+--verbose         More noise
 ```
 
-This respects the [NO_COLOR](https://no-color.org/) standard.
+Colors disabled with `NO_COLOR=1`.
 
-## Status Icons
+## Status
 
-- 🚧 Draft PR
-- ✅ Ready to merge
-- 👍 Has approval
-- 💥 Merge conflict
-- ⏰ Stale PR
-- ❌ Failing tests
-- 📝 Regular PR
+Draft, ready, approved, conflicted, stale, failing, or regular. You'll figure it out.
 
-## Why This Tool?
+## Why
 
-Stop context switching through GitHub tabs. This tool uses smart filtering to show only PRs that actually need your input - not PRs waiting on CI, other reviewers, or ones you've already reviewed.
-
-Built fast in Go because your development tools shouldn't slow you down.
+Because clicking through GitHub tabs is for people with too much time.
