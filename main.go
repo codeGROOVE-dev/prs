@@ -28,6 +28,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/codeGROOVE-dev/sprinkler/pkg/client"
 	"github.com/ready-to-review/turnclient/pkg/turn"
+	"golang.org/x/term"
 )
 
 // PR represents a GitHub pull request with all relevant information.
@@ -135,34 +136,33 @@ const (
 	cacheFileMode        = 0o644 // File permissions for cache files
 )
 
-// Style definitions.
+// Style definitions - modern minimalist palette
 var (
 	titleStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FF6B6B")).
-			Bold(true).
-			Underline(true)
-
-	headerStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#4ECDC4")).
-			Bold(true).
-			Padding(0, 1)
-
-	prTitleStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#45B7D1")).
+			Foreground(lipgloss.Color("#E5484D")). // Modern red
 			Bold(true)
 
+	headerStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#8B8B8B")). // Neutral gray
+			Bold(false)
+
+	prTitleStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FAFAFA")). // Almost white
+			Bold(false)
+
 	ageStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#96CEB4"))
+			Foreground(lipgloss.Color("#666666")).
+			Italic(true)
 
 	urlStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FECA57")).
+			Foreground(lipgloss.Color("#3E63DD")). // Modern blue
 			Underline(true)
 
 	infoStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#54A0FF"))
+			Foreground(lipgloss.Color("#8B8B8B")) // Neutral gray
 
 	successStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#5F27CD")).
+			Foreground(lipgloss.Color("#30A46C")). // Modern green
 			Bold(true)
 )
 
@@ -1432,28 +1432,28 @@ func updateDisplay(ctx context.Context, token, username string, blockingOnly, ve
 }
 
 func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, includeStale bool, excludedOrgs []string) string {
-	var buf strings.Builder
+	var output strings.Builder
 	
-	// Filter excluded orgs
+	// Filter out excluded orgs
 	if len(excludedOrgs) > 0 {
-		var filtered []PR
+		var filteredPRs []PR
 		for _, pr := range prs {
-			org := getOrgFromURL(pr.HTMLURL)
 			excluded := false
-			for _, excludedOrg := range excludedOrgs {
-				if org == excludedOrg {
+			prOrg := getOrgFromURL(pr.HTMLURL)
+			for _, excludeOrg := range excludedOrgs {
+				if prOrg == excludeOrg {
 					excluded = true
 					break
 				}
 			}
 			if !excluded {
-				filtered = append(filtered, pr)
+				filteredPRs = append(filteredPRs, pr)
 			}
 		}
-		prs = filtered
+		prs = filteredPRs
 	}
 	
-	// Filter out stale PRs unless includeStale is true
+	// Filter stale PRs unless includeStale is true
 	if !includeStale {
 		var filteredPRs []PR
 		for _, pr := range prs {
@@ -1476,138 +1476,152 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 	// Sort PRs by most recently updated
 	sortPRsByUpdateTime(prs)
 	
+	// Split into incoming and outgoing
 	incoming, outgoing := categorizePRs(prs, username)
-	blockingCount := countBlockingPRs(incoming, username, verbose)
 	
-	// Header
-	buf.WriteString("\n")
-	if blockingOnly && blockingCount > 0 {
-		plural := ""
-		if blockingCount != 1 {
-			plural = "s"
+	// Count blocking PRs
+	incomingBlockingCount := 0
+	for _, pr := range incoming {
+		if isBlockingOnUser(&pr, username) {
+			incomingBlockingCount++
 		}
-		header := fmt.Sprintf("🔥 %d PR%s awaiting your review", blockingCount, plural)
-		buf.WriteString(titleStyle.Render(header))
-		buf.WriteString("\n")
-	} else if !blockingOnly {
-		buf.WriteString(titleStyle.Render("📋 Pull Request Dashboard"))
-		buf.WriteString("\n\n")
-		
-		totalPRs := len(incoming) + len(outgoing)
-		summaryText := fmt.Sprintf("📊 %d total PR%s • %d incoming • %d outgoing • %d blocking you",
-			totalPRs, func() string {
-				if totalPRs == 1 {
-					return ""
-				}
-				return "s"
-			}(), len(incoming), len(outgoing), blockingCount)
-		buf.WriteString(infoStyle.Render(summaryText))
-		buf.WriteString("\n")
 	}
 	
-	// Incoming PRs
-	if len(incoming) > 0 && (!blockingOnly || blockingCount > 0) {
-		displayCount := 0
+	outgoingBlockingCount := 0
+	for _, pr := range outgoing {
+		if isBlockingOnUser(&pr, username) {
+			outgoingBlockingCount++
+		}
+	}
+
+	output.WriteString("\n")
+	
+	// Incoming PRs with integrated header
+	if len(incoming) > 0 && (!blockingOnly || incomingBlockingCount > 0) {
+		// Header with counts
+		output.WriteString(fmt.Sprintf("incoming - %d PRs", len(incoming)))
+		if incomingBlockingCount > 0 {
+			output.WriteString(", ")
+			output.WriteString(lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#E5484D")). // Red for blocked count
+				Bold(true).
+				Render(fmt.Sprintf("%d blocked on you", incomingBlockingCount)))
+		}
+		output.WriteString(":\n")
+
 		for _, pr := range incoming {
-			if !blockingOnly || isBlockingOnUser(&pr, username) {
-				displayCount++
+			if blockingOnly && !isBlockingOnUser(&pr, username) {
+				continue
 			}
+			output.WriteString(formatPR(pr, username))
+		}
+	}
+	
+	// Outgoing PRs with integrated header
+	if len(outgoing) > 0 && !blockingOnly {
+		if len(incoming) > 0 {
+			output.WriteString("\n")
 		}
 		
-		if displayCount > 0 {
-			buf.WriteString("\n")
-			buf.WriteString(headerStyle.Render("⬇️  Incoming PRs"))
-			buf.WriteString("\n\n")
-			
-			for _, pr := range incoming {
-				if blockingOnly && !isBlockingOnUser(&pr, username) {
-					continue
-				}
-				buf.WriteString(formatPRForDisplay(pr, username))
-			}
+		// Header with counts - gray color for distinction
+		output.WriteString(lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#8B8B8B")). // Gray for outgoing header
+			Render(fmt.Sprintf("outgoing - %d PRs", len(outgoing))))
+		if outgoingBlockingCount > 0 {
+			output.WriteString(", ")
+			output.WriteString(lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#E5484D")).
+				Bold(true).
+				Render(fmt.Sprintf("%d blocked on you", outgoingBlockingCount)))
 		}
-	}
-	
-	// Outgoing PRs
-	if len(outgoing) > 0 && !blockingOnly {
-		buf.WriteString("\n")
-		buf.WriteString(headerStyle.Render("⬆️  Your PRs"))
-		buf.WriteString("\n\n")
+		output.WriteString(":\n")
+		
 		for _, pr := range outgoing {
-			buf.WriteString(formatPRForDisplay(pr, username))
+			output.WriteString(formatPR(pr, username))
 		}
 	}
 	
-	if blockingOnly && blockingCount == 0 {
-		buf.WriteString("\n")
-		buf.WriteString(successStyle.Render("✨ No PRs awaiting your review - you're all caught up!"))
-		buf.WriteString("\n")
+	if blockingOnly && incomingBlockingCount == 0 {
+		// Show nothing when no PRs are blocking
+		return ""
 	}
 	
-	buf.WriteString("\n")
-	return buf.String()
+	output.WriteString("\n")
+	return output.String()
 }
 
-func formatPRForDisplay(pr PR, username string) string {
-	var buf strings.Builder
-	
-	// Format age
-	age := formatAge(pr.UpdatedAt)
-	
-	// Get PR icon based on status
-	icon := prIcon(&pr)
-	
-	// Prepare tags display with colors
-	var tagsDisplay string
-	if pr.TurnResponse != nil && len(pr.TurnResponse.PRState.Tags) > 0 {
-		var coloredTags []string
-		for _, tag := range pr.TurnResponse.PRState.Tags {
-			coloredTags = append(coloredTags, coloredTag(tag))
-		}
-		tagsDisplay = fmt.Sprintf(" %s", strings.Join(coloredTags, " "))
+// getTerminalWidth returns the current terminal width, defaulting to 80 if unable to detect
+func getTerminalWidth() int {
+	width, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || width <= 0 {
+		return 80 // Default terminal width
 	}
+	return width
+}
+
+func formatPR(pr PR, username string) string {
+	var output strings.Builder
 	
-	// Create styled components
-	var bulletColor string
-	if isBlockingOnUser(&pr, username) {
-		bulletColor = "#FF0000" // Intense red for blocked PRs
-	} else {
-		bulletColor = "#FF79C6" // Pink for regular PRs
-	}
-	bullet := lipgloss.NewStyle().Foreground(lipgloss.Color(bulletColor)).Render("●")
-	prIcon := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF79C6")).Render(icon)
-	title := prTitleStyle.Render(truncate(pr.Title, 60))
-	ageFormatted := ageStyle.Render(age)
-	urlFormatted := urlStyle.Render(truncateURL(pr.HTMLURL, truncatedURLLength))
+	// Get terminal width for dynamic truncation
+	termWidth := getTerminalWidth()
 	
-	// Create the main PR line with bullet
-	prLine := fmt.Sprintf("  %s %s %s", bullet, prIcon, title)
-	
-	// Add blocking indicator if user is blocked
-	if isBlockingOnUser(&pr, username) {
-		blockingIndicator := lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FF5555")).
+	// Blocking indicator - red bullet if blocking
+	isBlocking := isBlockingOnUser(&pr, username)
+	if isBlocking {
+		output.WriteString(lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#E5484D")). // Modern red
 			Bold(true).
-			Render(" ⚡")
-		prLine += blockingIndicator
+			Render("• "))
+	} else {
+		output.WriteString("• ")
 	}
 	
-	// Create size display
-	var sizeDisplay string
-	if pr.Additions > 0 || pr.Deletions > 0 || pr.ChangedFiles > 0 {
-		sizeDisplay = fmt.Sprintf(" +%d/-%d (%d files)", pr.Additions, pr.Deletions, pr.ChangedFiles)
+	// Calculate space available for title
+	// Account for: bullet (2), space after title (1), and URL estimate
+	parts := strings.Split(pr.HTMLURL, "/")
+	urlLength := 30 // Default estimate
+	if len(parts) >= 7 {
+		// Actual URL will be org/repo#number
+		urlLength = len(fmt.Sprintf("%s/%s#%s", parts[3], parts[4], parts[6]))
 	}
 	
-	// Create info line with indentation
-	infoLine := fmt.Sprintf("     %s • %s%s%s", ageFormatted, urlFormatted, sizeDisplay, tagsDisplay)
+	// Reserve space: bullet(2) + space(1) + url + some padding(5)
+	availableForTitle := termWidth - 2 - 1 - urlLength - 5
+	if availableForTitle < 20 {
+		availableForTitle = 20 // Minimum title length
+	}
 	
-	// Build output
-	buf.WriteString(prLine)
-	buf.WriteString("\n")
-	buf.WriteString(infoLine)
-	buf.WriteString("\n\n")
+	// Title - truncated based on available space
+	title := pr.Title
+	if len(title) > availableForTitle {
+		title = title[:availableForTitle-3] + "..."
+	}
+	// Style title in white
+	whiteTitle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#FFFFFF")).
+		Render(title)
+	output.WriteString(whiteTitle)
+	output.WriteString(" ")
 	
-	return buf.String()
+	// Shortened URL - just org/repo#number in blue
+	if len(parts) >= 7 {
+		shortURL := fmt.Sprintf("%s/%s#%s", parts[3], parts[4], parts[6])
+		// Style the URL in blue and make it clickable with OSC 8 hyperlink
+		blueURL := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#3E63DD")). // Modern blue
+			Render(shortURL)
+		// Wrap with OSC 8 hyperlink
+		output.WriteString(fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", pr.HTMLURL, blueURL))
+	} else {
+		// Fallback - still make it blue
+		blueURL := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#3E63DD")).
+			Render(pr.HTMLURL)
+		output.WriteString(blueURL)
+	}
+	
+	output.WriteString("\n")
+	return output.String()
 }
 
 func getOrgFromURL(url string) string {
