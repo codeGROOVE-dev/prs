@@ -119,7 +119,7 @@ func TestIsBlockingOnUser(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := isBlockingOnUser(tt.pr, tt.username)
+			got := isBlockingOnUser(&tt.pr, tt.username)
 			if got != tt.expected {
 				t.Errorf("isBlockingOnUser() = %v, want %v", got, tt.expected)
 			}
@@ -193,7 +193,7 @@ func TestWasBlockingBefore(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := wasBlockingBefore(tt.pr, tt.lastPRs, tt.username)
+			got := wasBlockingBefore(&tt.pr, tt.lastPRs, tt.username)
 			if got != tt.expected {
 				t.Errorf("wasBlockingBefore() = %v, want %v", got, tt.expected)
 			}

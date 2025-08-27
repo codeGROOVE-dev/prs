@@ -1,3 +1,4 @@
+// Package main implements a GitHub PR notifier CLI tool.
 package main
 
 import (
@@ -17,6 +18,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -29,28 +31,24 @@ import (
 
 // PR represents a GitHub pull request with all relevant information.
 type PR struct {
-	Number         int       `json:"number"`
-	Title          string    `json:"title"`
-	User           User      `json:"user"`
-	State          string    `json:"state"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
-	HTMLURL        string    `json:"html_url"`
-	Draft          bool      `json:"draft"`
-	ReviewComments int       `json:"review_comments"`
-	Comments       int       `json:"comments"`
-	Repository     struct {
+	CreatedAt    time.Time           `json:"created_at"`
+	UpdatedAt    time.Time           `json:"updated_at"`
+	TurnResponse *turn.CheckResponse `json:"turn_response,omitempty"`
+	Repository   struct {
 		FullName string `json:"full_name"`
 	} `json:"repository"`
+	Title              string `json:"title"`
+	User               User   `json:"user"`
+	State              string `json:"state"`
+	HTMLURL            string `json:"html_url"`
 	RequestedReviewers []User `json:"requested_reviewers"`
-
-	// Size information
-	Additions    int `json:"additions"`
-	Deletions    int `json:"deletions"`
-	ChangedFiles int `json:"changed_files"`
-
-	// Turn server metadata
-	TurnResponse *turn.CheckResponse `json:"turn_response,omitempty"`
+	ReviewComments     int    `json:"review_comments"`
+	Comments           int    `json:"comments"`
+	Number             int    `json:"number"`
+	Additions          int    `json:"additions"`
+	Deletions          int    `json:"deletions"`
+	ChangedFiles       int    `json:"changed_files"`
+	Draft              bool   `json:"draft"`
 }
 
 // User represents a GitHub user.
@@ -91,6 +89,17 @@ const (
 	defaultTurnServerURL = "https://turn.ready-to-review.dev"
 	maxConcurrent        = 20            // Increased for better throughput
 	cacheTTL             = 2 * time.Hour // 2 hours
+	maxOrgNameLength     = 39            // GitHub org name limit
+	minTokenLength       = 10            // Minimum GitHub token length
+	maxIdleConnsPerHost  = 10            // HTTP client setting
+	idleConnTimeout      = 90 * time.Second
+	minPRURLParts        = 6     // Minimum parts in PR URL
+	repoPartIndex        = 4     // Index of repo in URL parts
+	prTypePartIndex      = 5     // Index of PR type in URL parts
+	numberPartIndex      = 6     // Index of PR number in URL parts
+	daysInWeek           = 7     // Days in a week
+	truncatedURLLength   = 80    // Max URL display length
+	cacheFileMode        = 0o644 // File permissions for cache files
 )
 
 // Style definitions.
@@ -116,10 +125,6 @@ var (
 			Foreground(lipgloss.Color("#FECA57")).
 			Underline(true)
 
-	tagStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FF9FF3")).
-			Bold(true)
-
 	infoStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#54A0FF"))
 
@@ -130,12 +135,12 @@ var (
 
 // isValidOrgName validates GitHub organization names.
 func isValidOrgName(org string) bool {
-	if org == "" || len(org) > 39 { // GitHub org name limit
+	if org == "" || len(org) > maxOrgNameLength {
 		return false
 	}
 	for _, r := range org {
-		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') || r == '-' || r == '_') {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') &&
+			(r < '0' || r > '9') && r != '-' && r != '_' {
 			return false
 		}
 	}
@@ -144,14 +149,14 @@ func isValidOrgName(org string) bool {
 }
 
 // turnCache handles caching of Turn API responses.
-func turnCachePath(url string, updatedAt time.Time) string {
-	dir, _ := os.UserCacheDir()
-	if dir == "" {
+func turnCachePath(urlPath string, updatedAt time.Time) string {
+	dir, err := os.UserCacheDir()
+	if err != nil || dir == "" {
 		return "" // No cache if we can't find cache dir
 	}
 
 	// Simple hash for filename
-	h := sha256.Sum256([]byte(url + updatedAt.Format(time.RFC3339)))
+	h := sha256.Sum256([]byte(urlPath + updatedAt.Format(time.RFC3339)))
 	return filepath.Join(dir, "github-pr-notifier", "turn-cache", hex.EncodeToString(h[:8])+".json")
 }
 
@@ -168,7 +173,8 @@ func loadTurnCache(path string) (*turn.CheckResponse, bool) {
 
 	// Check if expired
 	if time.Since(entry.Timestamp) > cacheTTL {
-		os.Remove(path)
+		// Best effort removal of expired cache
+		os.Remove(path) //nolint:errcheck,gosec // Removal failures are acceptable
 		return nil, false
 	}
 
@@ -180,9 +186,12 @@ func saveTurnCache(path string, response *turn.CheckResponse) {
 		return
 	}
 
-	os.MkdirAll(filepath.Dir(path), 0o755)
-	data, _ := json.Marshal(cacheEntry{Response: response, Timestamp: time.Now()})
-	os.WriteFile(path, data, 0o644)
+	// Best effort cache write - failures are non-critical
+	os.MkdirAll(filepath.Dir(path), 0o755) //nolint:errcheck,gosec // Directory creation failures are acceptable
+	data, err := json.Marshal(cacheEntry{Response: response, Timestamp: time.Now()})
+	if err == nil {
+		os.WriteFile(path, data, cacheFileMode) //nolint:errcheck,gosec // Write failures are acceptable
+	}
 }
 
 func main() {
@@ -204,7 +213,7 @@ func main() {
 	if *org != "" {
 		// Allow only alphanumeric, dash, and underscore (GitHub org naming rules)
 		if !isValidOrgName(*org) {
-			fmt.Fprintf(os.Stderr, "error: invalid organization name\n")
+			fmt.Fprint(os.Stderr, "error: invalid organization name\n")
 			os.Exit(1)
 		}
 	}
@@ -222,8 +231,8 @@ func main() {
 		Timeout: defaultTimeout,
 		Transport: &http.Transport{
 			MaxIdleConns:        100, // Increased for better connection reuse
-			MaxIdleConnsPerHost: 10,  // Allow more connections per host
-			IdleConnTimeout:     90 * time.Second,
+			MaxIdleConnsPerHost: maxIdleConnsPerHost,
+			IdleConnTimeout:     idleConnTimeout,
 			DisableKeepAlives:   false,
 			DisableCompression:  false,
 			ForceAttemptHTTP2:   true, // Use HTTP/2 when available
@@ -233,15 +242,15 @@ func main() {
 	token, err := gitHubToken()
 	if err != nil {
 		logger.Printf("ERROR: Failed to get GitHub token: %v", err)
-		fmt.Fprintf(os.Stderr, "error: failed to authenticate with github\n")
+		fmt.Fprint(os.Stderr, "error: failed to authenticate with github\n")
 		os.Exit(1)
 	}
-	logger.Printf("INFO: Successfully retrieved GitHub token")
+	logger.Print("INFO: Successfully retrieved GitHub token")
 
 	username, err := currentUser(token, logger, httpClient)
 	if err != nil {
 		logger.Printf("ERROR: Failed to get current user: %v", err)
-		fmt.Fprintf(os.Stderr, "error: failed to identify github user\n")
+		fmt.Fprint(os.Stderr, "error: failed to identify github user\n")
 		os.Exit(1)
 	}
 	logger.Printf("INFO: Authenticated as user: %s", username)
@@ -252,7 +261,7 @@ func main() {
 		turnClient, err = turn.NewClient(*turnServer)
 		if err != nil {
 			logger.Printf("ERROR: Failed to create turn client for %s: %v", *turnServer, err)
-			fmt.Fprintf(os.Stderr, "warning: failed to connect to turn server\n")
+			fmt.Fprint(os.Stderr, "warning: failed to connect to turn server\n")
 			turnClient = nil
 		} else {
 			logger.Printf("INFO: Connected to turn server at %s", *turnServer)
@@ -280,17 +289,42 @@ func main() {
 
 	// If either watch or notify is set, run in watch mode
 	if *watch || *notify {
-		runWatchMode(ctx, token, username, *blocked, *notify, *bell, *watchInterval, logger, httpClient, turnClient, debug, *org, *includeStale)
+		cfg := &watchConfig{
+			token:        token,
+			username:     username,
+			blockingOnly: *blocked,
+			notifyMode:   *notify,
+			bell:         *bell,
+			interval:     *watchInterval,
+			logger:       logger,
+			httpClient:   httpClient,
+			turnClient:   turnClient,
+			debug:        debug,
+			org:          *org,
+			includeStale: *includeStale,
+		}
+		runWatchMode(ctx, cfg)
 	} else {
 		// One-time display
-		prs, err := fetchPRsWithRetry(ctx, token, username, logger, httpClient, turnClient, debug, *org)
+		query := &prQuery{
+			token:    token,
+			username: username,
+			org:      *org,
+			debug:    debug,
+		}
+		cls := &clients{
+			http: httpClient,
+			turn: turnClient,
+		}
+		prs, err := fetchPRsWithRetry(ctx, query, logger, cls)
 		if err != nil {
-			if err == context.Canceled {
-				fmt.Fprintf(os.Stderr, "\nOperation cancelled\n")
+			if errors.Is(err, context.Canceled) {
+				fmt.Fprint(os.Stderr, "\nOperation cancelled\n")
 			} else {
 				fmt.Fprintf(os.Stderr, "Error fetching PRs: %v\n", err)
 			}
-			os.Exit(1)
+			cancel()
+			return
 		}
 		displayPRs(prs, username, *blocked, debug, *includeStale)
 	}
@@ -304,19 +338,19 @@ func gitHubToken() (string, error) {
 	output, err := cmd.Output()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("timeout getting auth token")
+			return "", errors.New("timeout getting auth token")
 		}
 		return "", fmt.Errorf("failed to get auth token (is 'gh' installed and authenticated?): %w", err)
 	}
 
 	token := strings.TrimSpace(string(output))
 	if token == "" {
-		return "", fmt.Errorf("empty auth token received")
+		return "", errors.New("empty auth token received")
 	}
 
 	// Basic validation - GitHub tokens should be non-empty alphanumeric strings
-	if len(token) < 10 {
-		return "", fmt.Errorf("invalid token format")
+	if len(token) < minTokenLength {
+		return "", errors.New("invalid token format")
 	}
 
 	return token, nil
@@ -328,7 +362,8 @@ func currentUser(token string, logger *log.Logger, httpClient *http.Client) (str
 	err := retry.Do(
 		func() error {
 			logger.Printf("Making API call to GET %s", apiUserEndpoint)
-			req, err := http.NewRequest("GET", apiUserEndpoint, nil)
+			ctx := context.Background()
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiUserEndpoint, http.NoBody)
 			if err != nil {
 				return err
 			}
@@ -342,13 +377,16 @@ func currentUser(token string, logger *log.Logger, httpClient *http.Client) (str
 				logger.Printf("HTTP request failed: %v", err)
 				return err
 			}
-			defer resp.Body.Close()
+			defer resp.Body.Close() //nolint:errcheck // Best effort close
 
 			if resp.StatusCode == http.StatusUnauthorized {
 				return errors.New("invalid GitHub token")
 			}
 			if resp.StatusCode != http.StatusOK {
-				body, _ := io.ReadAll(resp.Body)
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					return fmt.Errorf("failed to read response body: %w", err)
+				}
 				return fmt.Errorf("GitHub API error (status %d): %s", resp.StatusCode, body)
 			}
 
@@ -375,7 +413,7 @@ func currentUser(token string, logger *log.Logger, httpClient *http.Client) (str
 	return username, err
 }
 
-func fetchPRsWithRetry(ctx context.Context, token, username string, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, debug bool, org string) ([]PR, error) {
+func fetchPRsWithRetry(ctx context.Context, query *prQuery, logger *log.Logger, cls *clients) ([]PR, error) {
 	var prs []PR
 
 	err := retry.Do(
@@ -386,7 +424,7 @@ func fetchPRsWithRetry(ctx context.Context, token, username string, logger *log.
 			default:
 			}
 
-			result, err := fetchPRs(ctx, token, username, logger, httpClient, turnClient, debug, org)
+			result, err := fetchPRs(ctx, query, logger, cls)
 			if err != nil {
 				return err
 			}
@@ -407,37 +445,37 @@ func fetchPRsWithRetry(ctx context.Context, token, username string, logger *log.
 	return prs, err
 }
 
-func fetchPRs(ctx context.Context, token, username string, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, debug bool, org string) ([]PR, error) {
+func fetchPRs(ctx context.Context, query *prQuery, logger *log.Logger, cls *clients) ([]PR, error) {
 	// Query 1: PRs that involve the user (mentioned, assigned, review requested, etc.)
-	query1 := fmt.Sprintf("is:open is:pr involves:%s archived:false", username)
-	if org != "" {
+	query1 := fmt.Sprintf("is:open is:pr involves:%s archived:false", query.username)
+	if query.org != "" {
 		// org is already validated, safe to use
-		query1 += fmt.Sprintf(" org:%s", org)
+		query1 += fmt.Sprintf(" org:%s", query.org)
 	}
 
 	// Query 2: PRs authored by the user
-	query2 := fmt.Sprintf("is:open is:pr user:%s archived:false", username)
-	if org != "" {
-		query2 += fmt.Sprintf(" org:%s", org)
+	query2 := fmt.Sprintf("is:open is:pr user:%s archived:false", query.username)
+	if query.org != "" {
+		query2 += fmt.Sprintf(" org:%s", query.org)
 	}
 
 	// Execute both queries
-	resp1, err := makeGitHubSearchRequest(ctx, query1, token, httpClient, logger)
+	resp1, err := makeGitHubSearchRequest(ctx, query1, query.token, cls.http, logger)
 	if err != nil {
 		return nil, err
 	}
-	defer resp1.Body.Close()
+	defer resp1.Body.Close() //nolint:errcheck // Best effort close
 
 	prs1, err := parseSearchResponse(resp1)
 	if err != nil {
 		return nil, err
 	}
 
-	resp2, err := makeGitHubSearchRequest(ctx, query2, token, httpClient, logger)
+	resp2, err := makeGitHubSearchRequest(ctx, query2, query.token, cls.http, logger)
 	if err != nil {
 		return nil, err
 	}
-	defer resp2.Body.Close()
+	defer resp2.Body.Close() //nolint:errcheck // Best effort close
 
 	prs2, err := parseSearchResponse(resp2)
 	if err != nil {
@@ -445,21 +483,16 @@ func fetchPRs(ctx context.Context, token, username string, logger *log.Logger, h
 	}
 
 	// Combine results
-	prs := append(prs1, prs2...)
+	prs := make([]PR, 0, len(prs1)+len(prs2))
+	prs = append(prs, prs1...)
+	prs = append(prs, prs2...)
 
 	logger.Printf("Found %d PRs (before deduplication)", len(prs))
 	prs = deduplicatePRs(prs)
 	logger.Printf("Found %d PRs (after deduplication)", len(prs))
 
-	if err := enrichPRsParallel(ctx, token, prs, logger, httpClient, turnClient, username, debug); err != nil {
-		if errors.Is(err, context.Canceled) {
-			return nil, err
-		}
-		logger.Printf("WARNING: Failed to enrich some PR data: %v", err)
-		// Continue with partial results rather than failing completely
-	} else {
-		logger.Printf("INFO: Successfully enriched all %d PRs", len(prs))
-	}
+	enrichPRsParallel(ctx, query.token, prs, logger, cls.http, cls.turn, query.username, query.debug)
+	logger.Printf("INFO: Successfully enriched all %d PRs", len(prs))
 
 	return prs, nil
 }
@@ -467,13 +500,13 @@ func fetchPRs(ctx context.Context, token, username string, logger *log.Logger, h
 func makeGitHubSearchRequest(ctx context.Context, query, token string, httpClient *http.Client, logger *log.Logger) (*http.Response, error) {
 	params := url.Values{}
 	params.Add("q", query)
-	params.Add("per_page", fmt.Sprintf("%d", maxPerPage))
+	params.Add("per_page", strconv.Itoa(maxPerPage))
 	params.Add("sort", "updated")
 
 	apiURL := fmt.Sprintf("%s?%s", apiSearchEndpoint, params.Encode())
 	logger.Printf("Making API call to GET %s", apiURL)
 
-	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, http.NoBody)
 	if err != nil {
 		return nil, err
 	}
@@ -481,7 +514,7 @@ func makeGitHubSearchRequest(ctx context.Context, query, token string, httpClien
 	req.Header.Set("Authorization", "token "+token)
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 	req.Header.Set("User-Agent", "github-pr-notifier-cli")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("X-Github-Api-Version", "2022-11-28")
 
 	start := time.Now()
 	resp, err := httpClient.Do(req)
@@ -504,8 +537,8 @@ func parseSearchResponse(resp *http.Response) ([]PR, error) {
 	}
 	if resp.StatusCode == http.StatusForbidden {
 		// Check for rate limit headers
-		if remaining := resp.Header.Get("X-RateLimit-Remaining"); remaining == "0" {
-			resetTime := resp.Header.Get("X-RateLimit-Reset")
+		if remaining := resp.Header.Get("X-Ratelimit-Remaining"); remaining == "0" {
+			resetTime := resp.Header.Get("X-Ratelimit-Reset")
 			return nil, fmt.Errorf("github api rate limit exceeded, resets at %s", resetTime)
 		}
 		return nil, handleHTTPError(resp, "github api access forbidden")
@@ -533,21 +566,23 @@ func deduplicatePRs(prs []PR) []PR {
 
 	seen := make(map[string]PR, len(prs))
 
-	for _, pr := range prs {
-		if existing, exists := seen[pr.HTMLURL]; !exists || pr.UpdatedAt.After(existing.UpdatedAt) {
-			seen[pr.HTMLURL] = pr
+	for i := range prs {
+		if existing, exists := seen[prs[i].HTMLURL]; !exists || prs[i].UpdatedAt.After(existing.UpdatedAt) {
+			seen[prs[i].HTMLURL] = prs[i]
 		}
 	}
 
 	result := make([]PR, 0, len(seen))
-	for _, pr := range seen {
-		result = append(result, pr)
+	for k := range seen {
+		result = append(result, seen[k])
 	}
 
 	return result
 }
 
-func enrichPRsParallel(ctx context.Context, token string, prs []PR, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, username string, debug bool) error {
+func enrichPRsParallel(ctx context.Context, _ string, prs []PR, logger *log.Logger,
+	_ *http.Client, turnClient *turn.Client, username string, debug bool,
+) {
 	// Simple semaphore pattern - Rob Pike style
 	sem := make(chan struct{}, maxConcurrent)
 	var wg sync.WaitGroup
@@ -573,30 +608,29 @@ func enrichPRsParallel(ctx context.Context, token string, prs []PR, logger *log.
 	}
 
 	wg.Wait()
-	return nil
 }
 
 func fetchPRDetails(ctx context.Context, pr *PR, logger *log.Logger, debug bool) error {
 	// Get token from environment
 	token := os.Getenv("GITHUB_TOKEN")
 	if token == "" {
-		return fmt.Errorf("GITHUB_TOKEN not set")
+		return errors.New("GITHUB_TOKEN not set")
 	}
 
 	// Extract repository info from PR URL
 	// URL format: https://github.com/owner/repo/pull/123
 	parts := strings.Split(pr.HTMLURL, "/")
-	if len(parts) < 6 {
+	if len(parts) < minPRURLParts {
 		return fmt.Errorf("invalid PR URL format: %s", pr.HTMLURL)
 	}
 	owner := parts[3]
-	repo := parts[4]
+	repo := parts[repoPartIndex]
 
 	// Build API URL
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d", owner, repo, pr.Number)
 
 	// Create request
-	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, http.NoBody)
 	if err != nil {
 		return err
 	}
@@ -610,9 +644,9 @@ func fetchPRDetails(ctx context.Context, pr *PR, logger *log.Logger, debug bool)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // Best effort close
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("GitHub API returned status %d", resp.StatusCode)
 	}
 
@@ -649,51 +683,73 @@ func enrichPRData(ctx context.Context, pr *PR, logger *log.Logger, turnClient *t
 	}
 
 	// Enrich with turn server data if available
-	if turnClient != nil {
-		// Validate PR URL before sending to turn server
-		if pr.HTMLURL == "" || !strings.HasPrefix(pr.HTMLURL, "https://github.com/") {
-			logger.Printf("WARNING: Invalid PR URL for turn enrichment: %s", pr.HTMLURL)
-			return nil
-		}
+	if turnClient == nil {
+		return nil
+	}
+	return enrichWithTurnData(ctx, pr, logger, turnClient, username, debug)
+}
 
-		// Check cache first
-		cachePath := turnCachePath(pr.HTMLURL, pr.UpdatedAt)
-		if cached, found := loadTurnCache(cachePath); found {
-			pr.TurnResponse = cached
-			return nil
-		}
-
-		// Cache miss
-		if debug && cachePath != "" {
-			logger.Printf("INFO: Cache miss for PR #%d", pr.Number)
-		}
-
-		turnStart := time.Now()
-		if debug {
-			logger.Printf("Sending turnclient request for PR #%d: URL=%s, UpdatedAt=%s",
-				pr.Number, pr.HTMLURL, pr.UpdatedAt.Format(time.RFC3339))
-		}
-
-		turnResponse, err := turnClient.Check(ctx, pr.HTMLURL, username, pr.UpdatedAt)
-		if err != nil {
-			logger.Printf("WARNING: Failed to get turn data for PR #%d: %v", pr.Number, err)
-			// Don't fail the entire enrichment if turn server is unavailable
-		} else if turnResponse != nil {
-			pr.TurnResponse = turnResponse
-			// Save to cache
-			saveTurnCache(cachePath, turnResponse)
-			if debug {
-				logger.Printf("Turn server call for PR #%d took %v", pr.Number, time.Since(turnStart))
-				responseJSON, _ := json.MarshalIndent(turnResponse, "", "  ")
-				logger.Printf("Received turnclient response for PR #%d: %s", pr.Number, string(responseJSON))
-			}
-		}
+func enrichWithTurnData(ctx context.Context, pr *PR, logger *log.Logger, turnClient *turn.Client, username string, debug bool) error {
+	// Validate PR URL before sending to turn server
+	if pr.HTMLURL == "" || !strings.HasPrefix(pr.HTMLURL, "https://github.com/") {
+		logger.Printf("WARNING: Invalid PR URL for turn enrichment: %s", pr.HTMLURL)
+		return nil
 	}
 
+	// Check cache first
+	cachePath := turnCachePath(pr.HTMLURL, pr.UpdatedAt)
+	if cached, found := loadTurnCache(cachePath); found {
+		pr.TurnResponse = cached
+		return nil
+	}
+
+	// Cache miss
+	if debug && cachePath != "" {
+		logger.Printf("INFO: Cache miss for PR #%d", pr.Number)
+	}
+
+	return fetchAndCacheTurnData(ctx, pr, logger, turnClient, username, debug, cachePath)
+}
+
+func fetchAndCacheTurnData(ctx context.Context, pr *PR, logger *log.Logger,
+	turnClient *turn.Client, username string, debug bool, cachePath string,
+) error {
+	turnStart := time.Now()
+	if debug {
+		logger.Printf("Sending turnclient request for PR #%d: URL=%s, UpdatedAt=%s",
+			pr.Number, pr.HTMLURL, pr.UpdatedAt.Format(time.RFC3339))
+	}
+
+	turnResponse, err := turnClient.Check(ctx, pr.HTMLURL, username, pr.UpdatedAt)
+	if err != nil {
+		logger.Printf("WARNING: Failed to get turn data for PR #%d: %v", pr.Number, err)
+		return nil // Don't fail the entire enrichment if turn server is unavailable
+	}
+
+	if turnResponse == nil {
+		return nil
+	}
+
+	pr.TurnResponse = turnResponse
+	saveTurnCache(cachePath, turnResponse)
+
+	if debug {
+		logDebugTurnResponse(logger, pr.Number, turnResponse, time.Since(turnStart))
+	}
 	return nil
 }
 
-func isBlockingOnUser(pr PR, username string) bool {
+func logDebugTurnResponse(logger *log.Logger, prNumber int, turnResponse *turn.CheckResponse, duration time.Duration) {
+	logger.Printf("Turn server call for PR #%d took %v", prNumber, duration)
+	responseJSON, err := json.MarshalIndent(turnResponse, "", "  ")
+	if err != nil {
+		logger.Printf("Failed to marshal turn response: %v", err)
+	} else {
+		logger.Printf("Received turnclient response for PR #%d: %s", prNumber, string(responseJSON))
+	}
+}
+
+func isBlockingOnUser(pr *PR, username string) bool {
 	// If we have turn client data, use that for blocking determination
 	if pr.TurnResponse != nil && pr.TurnResponse.PRState.UnblockAction != nil {
 		_, hasAction := pr.TurnResponse.PRState.UnblockAction[username]
@@ -713,10 +769,10 @@ func displayPRs(prs []PR, username string, blockingOnly bool, debug bool, includ
 	// Filter out stale PRs unless includeStale is true
 	if !includeStale {
 		var filteredPRs []PR
-		for _, pr := range prs {
+		for i := range prs {
 			isStale := false
-			if pr.TurnResponse != nil {
-				for _, tag := range pr.TurnResponse.PRState.Tags {
+			if prs[i].TurnResponse != nil {
+				for _, tag := range prs[i].TurnResponse.PRState.Tags {
 					if tag == "stale" {
 						isStale = true
 						break
@@ -724,7 +780,7 @@ func displayPRs(prs []PR, username string, blockingOnly bool, debug bool, includ
 				}
 			}
 			if !isStale {
-				filteredPRs = append(filteredPRs, pr)
+				filteredPRs = append(filteredPRs, prs[i])
 			}
 		}
 		prs = filteredPRs
@@ -751,30 +807,30 @@ func displayPRs(prs []PR, username string, blockingOnly bool, debug bool, includ
 }
 
 func categorizePRs(prs []PR, username string) (incoming, outgoing []PR) {
-	for _, pr := range prs {
-		if pr.User.Login == username {
-			outgoing = append(outgoing, pr)
+	for i := range prs {
+		if prs[i].User.Login == username {
+			outgoing = append(outgoing, prs[i])
 		} else {
-			incoming = append(incoming, pr)
+			incoming = append(incoming, prs[i])
 		}
 	}
-	return
+	return incoming, outgoing
 }
 
 func countBlockingPRs(prs []PR, username string, debug bool) int {
 	count := 0
-	for _, pr := range prs {
-		if isBlockingOnUser(pr, username) {
+	for i := range prs {
+		if isBlockingOnUser(&prs[i], username) {
 			count++
 		}
 		if debug {
-			debugPR(pr, username)
+			debugPR(&prs[i], username)
 		}
 	}
 	return count
 }
 
-func debugPR(pr PR, username string) {
+func debugPR(pr *PR, username string) {
 	blocking := isBlockingOnUser(pr, username)
 	fmt.Fprintf(os.Stderr, "[DEBUG] PR #%d (%s) - blocking: %v\n", pr.Number, pr.Title, blocking)
 	if pr.TurnResponse != nil {
@@ -814,8 +870,8 @@ func displayHeader(blockingOnly bool, blockingCount, incomingCount, outgoingCoun
 func displayIncomingPRs(incoming []PR, username string, blockingOnly bool) {
 	// Count PRs that will actually be displayed
 	displayCount := 0
-	for _, pr := range incoming {
-		if !blockingOnly || isBlockingOnUser(pr, username) {
+	for i := range incoming {
+		if !blockingOnly || isBlockingOnUser(&incoming[i], username) {
 			displayCount++
 		}
 	}
@@ -827,11 +883,11 @@ func displayIncomingPRs(incoming []PR, username string, blockingOnly bool) {
 		fmt.Print("\n")
 	}
 
-	for _, pr := range incoming {
-		if blockingOnly && !isBlockingOnUser(pr, username) {
+	for i := range incoming {
+		if blockingOnly && !isBlockingOnUser(&incoming[i], username) {
 			continue
 		}
-		displayPR(pr, username)
+		displayPR(&incoming[i], username)
 	}
 }
 
@@ -839,12 +895,12 @@ func displayOutgoingPRs(outgoing []PR, username string) {
 	fmt.Print("\n")
 	fmt.Println(headerStyle.Render("⬆️  Your PRs"))
 	fmt.Print("\n")
-	for _, pr := range outgoing {
-		displayPR(pr, username)
+	for i := range outgoing {
+		displayPR(&outgoing[i], username)
 	}
 }
 
-func displayPR(pr PR, username string) {
+func displayPR(pr *PR, username string) {
 	// Format age
 	age := formatAge(pr.UpdatedAt)
 
@@ -872,7 +928,7 @@ func displayPR(pr PR, username string) {
 	prIcon := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF79C6")).Render(icon)
 	title := prTitleStyle.Render(truncate(pr.Title, 60))
 	ageFormatted := ageStyle.Render(age)
-	url := urlStyle.Render(truncateURL(pr.HTMLURL, 80))
+	urlFormatted := urlStyle.Render(truncateURL(pr.HTMLURL, truncatedURLLength))
 
 	// Create the main PR line with bullet
 	prLine := fmt.Sprintf("  %s %s %s", bullet, prIcon, title)
@@ -893,7 +949,7 @@ func displayPR(pr PR, username string) {
 	}
 
 	// Create info line with indentation
-	infoLine := fmt.Sprintf("     %s • %s%s%s", ageFormatted, url, sizeDisplay, tagsDisplay)
+	infoLine := fmt.Sprintf("     %s • %s%s%s", ageFormatted, urlFormatted, sizeDisplay, tagsDisplay)
 
 	// Print with nice spacing
 	fmt.Println(prLine)
@@ -901,7 +957,7 @@ func displayPR(pr PR, username string) {
 	fmt.Println()
 }
 
-func prIcon(pr PR) string {
+func prIcon(pr *PR) string {
 	if pr.Draft {
 		return "🚧"
 	}
@@ -919,6 +975,8 @@ func prIcon(pr PR) string {
 				return "⏰"
 			case "failing_tests":
 				return "❌"
+			default:
+				// Continue checking other tags
 			}
 		}
 	}
@@ -973,7 +1031,7 @@ func formatAge(t time.Time) string {
 		return fmt.Sprintf("%dm", int(d.Minutes()))
 	case d < 24*time.Hour:
 		return fmt.Sprintf("%dh", int(d.Hours()))
-	case d < 7*24*time.Hour:
+	case d < daysInWeek*24*time.Hour:
 		return fmt.Sprintf("%dd", int(d.Hours()/24))
 	case d < 30*24*time.Hour:
 		return fmt.Sprintf("%dw", int(d.Hours()/(24*7)))
@@ -989,19 +1047,19 @@ func truncate(s string, n int) string {
 	return s[:n-3] + "..."
 }
 
-func truncateURL(url string, maxLen int) string {
-	if len(url) <= maxLen {
-		return url
+func truncateURL(urlStr string, maxLen int) string {
+	if len(urlStr) <= maxLen {
+		return urlStr
 	}
 
 	// Keep the important parts of GitHub URLs
-	parts := strings.Split(url, "/")
-	if len(parts) >= 6 && strings.Contains(url, "github.com") {
+	parts := strings.Split(urlStr, "/")
+	if len(parts) >= minPRURLParts && strings.Contains(urlStr, "github.com") {
 		// Extract owner/repo/pull/number
 		owner := parts[3]
-		repo := parts[4]
-		prType := parts[5]
-		number := parts[6]
+		repo := parts[repoPartIndex]
+		prType := parts[prTypePartIndex]
+		number := parts[numberPartIndex]
 		shortened := fmt.Sprintf("github.com/%s/%s/%s/%s", owner, repo, prType, number)
 		if len(shortened) <= maxLen {
 			return shortened
@@ -1009,47 +1067,58 @@ func truncateURL(url string, maxLen int) string {
 	}
 
 	// Fallback to regular truncation
-	return truncate(url, maxLen)
+	return truncate(urlStr, maxLen)
 }
 
-func runWatchMode(ctx context.Context, token, username string, blockingOnly bool, notifyMode bool, bell bool, interval time.Duration, logger *log.Logger, httpClient *http.Client, turnClient *turn.Client, debug bool, org string, includeStale bool) {
+// clients holds HTTP and Turn clients.
+type clients struct {
+	http *http.Client
+	turn *turn.Client
+}
+
+// prQuery holds parameters for PR queries.
+type prQuery struct {
+	token    string
+	username string
+	org      string
+	debug    bool
+}
+
+// watchConfig holds configuration for watch mode.
+type watchConfig struct {
+	logger       *log.Logger
+	httpClient   *http.Client
+	turnClient   *turn.Client
+	token        string
+	username     string
+	org          string
+	interval     time.Duration
+	blockingOnly bool
+	notifyMode   bool
+	bell         bool
+	debug        bool
+	includeStale bool
+}
+
+func runWatchMode(ctx context.Context, cfg *watchConfig) {
+	runWatch(ctx, cfg)
+}
+
+func runWatch(ctx context.Context, cfg *watchConfig) {
 	// Clear screen only if not in notify mode
-	if !notifyMode {
+	if !cfg.notifyMode {
 		fmt.Print("\033[H\033[2J")
 	}
 
 	var lastPRs []PR
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(cfg.interval)
 	defer ticker.Stop()
 
-	// Initial fetch and display (unless notify-only mode)
-	prs, err := fetchPRsWithRetry(ctx, token, username, logger, httpClient, turnClient, debug, org)
-	if err != nil {
-		if err != context.Canceled {
-			fmt.Fprintf(os.Stderr, "Error fetching PRs: %v\n", err)
-		}
-	} else {
-		// In notify mode, don't set lastPRs initially - start fresh
-		if !notifyMode {
-			lastPRs = prs
-			header := "🔄 Live PR Dashboard - Press 'q' to quit"
-			fmt.Println(titleStyle.Render(header))
-			fmt.Println()
-			displayPRs(prs, username, blockingOnly, debug, includeStale)
-		}
-	}
+	// Initial fetch and display
+	lastPRs = handleInitialFetch(ctx, cfg)
 
 	// Set up interrupt handler
-	quitCh := make(chan bool)
-	go func() {
-		scanner := bufio.NewScanner(os.Stdin)
-		for scanner.Scan() {
-			if scanner.Text() == "q" {
-				quitCh <- true
-				return
-			}
-		}
-	}()
+	quitCh := setupQuitHandler()
 
 	for {
 		select {
@@ -1057,58 +1126,25 @@ func runWatchMode(ctx context.Context, token, username string, blockingOnly bool
 			fmt.Println("\nShutting down...")
 			return
 		case <-ticker.C:
-			prs, err := fetchPRsWithRetry(ctx, token, username, logger, httpClient, turnClient, debug, org)
+			query := &prQuery{
+				token:    cfg.token,
+				username: cfg.username,
+				org:      cfg.org,
+				debug:    cfg.debug,
+			}
+			cls := &clients{
+				http: cfg.httpClient,
+				turn: cfg.turnClient,
+			}
+			prs, err := fetchPRsWithRetry(ctx, query, cfg.logger, cls)
 			if err != nil {
-				if err != context.Canceled {
+				if !errors.Is(err, context.Canceled) {
 					fmt.Fprintf(os.Stderr, "Error fetching PRs: %v\n", err)
 				}
 				continue
 			}
 
-			// If not in notify-only mode, clear and redraw
-			if !notifyMode {
-				fmt.Print("\033[H\033[2J")
-				header := "🔄 Live PR Dashboard - Press 'q' to quit"
-				fmt.Println(titleStyle.Render(header))
-				fmt.Println()
-				displayPRs(prs, username, blockingOnly, debug, includeStale)
-			}
-			// In notify mode, don't clear screen - just show new PRs below
-
-			// Check for new PRs based on mode
-			if notifyMode {
-				if blockingOnly {
-					// Notify only for newly blocking PRs
-					// Show only newly blocking PRs with regular formatting
-					newBlockingPRs := []PR{}
-					for _, pr := range prs {
-						if isBlockingOnUser(pr, username) && !wasBlockingBefore(pr, lastPRs, username) {
-							newBlockingPRs = append(newBlockingPRs, pr)
-						}
-					}
-					for _, pr := range newBlockingPRs {
-						if bell {
-							fmt.Print("\a") // ASCII bell for attention
-						}
-						displayPR(pr, username)
-					}
-				} else {
-					// Show all new PRs with regular formatting
-					newPRs := []PR{}
-					for _, pr := range prs {
-						_, exists := findPRInList(pr, lastPRs)
-						if !exists {
-							newPRs = append(newPRs, pr)
-						}
-					}
-					for _, pr := range newPRs {
-						if bell {
-							fmt.Print("\a") // ASCII bell for attention
-						}
-						displayPR(pr, username)
-					}
-				}
-			}
+			handleUpdate(cfg, prs, lastPRs)
 
 			lastPRs = prs
 
@@ -1119,18 +1155,115 @@ func runWatchMode(ctx context.Context, token, username string, blockingOnly bool
 	}
 }
 
-func wasBlockingBefore(pr PR, previous []PR, username string) bool {
+func wasBlockingBefore(pr *PR, previous []PR, username string) bool {
 	if found, exists := findPRInList(pr, previous); exists {
-		return isBlockingOnUser(found, username)
+		return isBlockingOnUser(&found, username)
 	}
 	return false
 }
 
-func findPRInList(target PR, prs []PR) (PR, bool) {
-	for _, pr := range prs {
-		if pr.Number == target.Number && pr.Repository.FullName == target.Repository.FullName {
-			return pr, true
+func findPRInList(target *PR, prs []PR) (PR, bool) {
+	for i := range prs {
+		if prs[i].Number == target.Number && prs[i].Repository.FullName == target.Repository.FullName {
+			return prs[i], true
 		}
 	}
 	return PR{}, false
+}
+
+func handleInitialFetch(ctx context.Context, cfg *watchConfig) []PR {
+	query := &prQuery{
+		token:    cfg.token,
+		username: cfg.username,
+		org:      cfg.org,
+		debug:    cfg.debug,
+	}
+	cls := &clients{
+		http: cfg.httpClient,
+		turn: cfg.turnClient,
+	}
+	prs, err := fetchPRsWithRetry(ctx, query, cfg.logger, cls)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			fmt.Fprintf(os.Stderr, "Error fetching PRs: %v\n", err)
+		}
+		return nil
+	}
+
+	if !cfg.notifyMode {
+		header := "🔄 Live PR Dashboard - Press 'q' to quit"
+		fmt.Println(titleStyle.Render(header))
+		fmt.Println()
+		displayPRs(prs, cfg.username, cfg.blockingOnly, cfg.debug, cfg.includeStale)
+		return prs
+	}
+	return nil
+}
+
+func setupQuitHandler() chan bool {
+	quitCh := make(chan bool)
+	go func() {
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			if scanner.Text() == "q" {
+				quitCh <- true
+				return
+			}
+		}
+	}()
+	return quitCh
+}
+
+func handleUpdate(cfg *watchConfig, prs, lastPRs []PR) {
+	if !cfg.notifyMode {
+		displayLiveDashboard(cfg, prs)
+	} else {
+		handleNotifyMode(cfg, prs, lastPRs)
+	}
+}
+
+func displayLiveDashboard(cfg *watchConfig, prs []PR) {
+	fmt.Print("\033[H\033[2J")
+	header := "🔄 Live PR Dashboard - Press 'q' to quit"
+	fmt.Println(titleStyle.Render(header))
+	fmt.Println()
+	displayPRs(prs, cfg.username, cfg.blockingOnly, cfg.debug, cfg.includeStale)
+}
+
+func handleNotifyMode(cfg *watchConfig, prs, lastPRs []PR) {
+	if cfg.blockingOnly {
+		notifyBlockingPRs(cfg, prs, lastPRs)
+	} else {
+		notifyAllNewPRs(cfg, prs, lastPRs)
+	}
+}
+
+func notifyBlockingPRs(cfg *watchConfig, prs, lastPRs []PR) {
+	newBlockingPRs := []PR{}
+	for i := range prs {
+		if isBlockingOnUser(&prs[i], cfg.username) && !wasBlockingBefore(&prs[i], lastPRs, cfg.username) {
+			newBlockingPRs = append(newBlockingPRs, prs[i])
+		}
+	}
+	displayNewPRs(newBlockingPRs, cfg.username, cfg.bell)
+}
+
+func notifyAllNewPRs(cfg *watchConfig, prs, lastPRs []PR) {
+	newPRs := []PR{}
+	for i := range prs {
+		_, exists := findPRInList(&prs[i], lastPRs)
+		if !exists {
+			newPRs = append(newPRs, prs[i])
+		}
+	}
+	displayNewPRs(newPRs, cfg.username, cfg.bell)
+}
+
+func displayNewPRs(prs []PR, username string, bell bool) {
+	for i := range prs {
+		if bell {
+			fmt.Print("\a") // ASCII bell for attention
+		}
+		displayPR(&prs[i], username)
+	}
 }
