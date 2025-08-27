@@ -2,7 +2,10 @@
 # BEGIN: lint-install .
 # http://github.com/codeGROOVE-dev/lint-install
 
-.PHONY: lint
+.PHONY: lint test
+test:
+	go test -race ./...
+
 lint: _lint
 
 LINT_ARCH := $(shell uname -m)

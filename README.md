@@ -44,11 +44,19 @@ prs --notify
 
 - `--blocked` - Only PRs blocking on you
 - `--include-stale` - Include old PRs (hidden by default)
-- `--watch` - Live updates
-- `--notify` - Desktop notifications
-- `--bell` - Ring ASCII bell for new PRs in notify mode (default: true)
-- `--org` - Filter to specific organization
-- `--debug` - Show debug info
+- `--watch` - Live updates with real-time WebSocket + polling
+- `--exclude-orgs` - Comma-separated list of organizations to exclude
+- `--verbose` - Show detailed logging
+
+### Color Output
+
+Colors are automatically adjusted based on your terminal capabilities. To disable colors entirely:
+
+```bash
+NO_COLOR=1 prs
+```
+
+This respects the [NO_COLOR](https://no-color.org/) standard.
 
 ## Status Icons
 
