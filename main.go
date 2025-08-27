@@ -106,7 +106,7 @@ func (t *prRefreshTracker) markRefreshed(prURL string) {
 
 const (
 	defaultTimeout        = 30 * time.Second
-	defaultWatchInterval  = 90 * time.Second
+	defaultWatchInterval  = 60 * time.Second
 	maxPerPage            = 100
 	retryAttempts         = 3
 	retryDelay            = time.Second
@@ -1081,7 +1081,7 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 	}
 
 	// Outgoing PRs with integrated header
-	if len(outgoing) > 0 && !blockingOnly {
+	if len(outgoing) > 0 && (!blockingOnly || outgoingBlockingCount > 0) {
 		if len(incoming) > 0 {
 			output.WriteString("\n")
 		}
@@ -1105,6 +1105,9 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 		output.WriteString(":\n")
 
 		for i := range outgoing {
+			if blockingOnly && !isBlockingOnUser(&outgoing[i], username) {
+				continue
+			}
 			output.WriteString(formatPR(&outgoing[i], username))
 		}
 	}
