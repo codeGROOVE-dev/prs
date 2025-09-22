@@ -192,6 +192,7 @@ func main() {
 		verbose      = flag.Bool("verbose", false, "Show verbose logging from libraries")
 		excludeOrgs  = flag.String("exclude-orgs", "", "Comma-separated list of orgs to exclude")
 		includeStale = flag.Bool("include-stale", false, "Include PRs that haven't been modified in 90 days")
+		user         = flag.String("user", "", "View PRs for specified user instead of authenticated user")
 	)
 	flag.Parse()
 
@@ -229,14 +230,21 @@ func main() {
 	}
 	logger.Print("INFO: Successfully retrieved GitHub token")
 
-	username, err := currentUser(ctx, token, logger, httpClient)
-	if err != nil {
-		logger.Printf("ERROR: Failed to get current user: %v", err)
-		fmt.Fprint(os.Stderr, "error: failed to identify github user\n")
-		cancel()
-		return
+	// Determine the username to use - either specified via --user or the authenticated user
+	var username string
+	if *user != "" {
+		username = *user
+		logger.Printf("INFO: Using specified user: %s", username)
+	} else {
+		username, err = currentUser(ctx, token, logger, httpClient)
+		if err != nil {
+			logger.Printf("ERROR: Failed to get current user: %v", err)
+			fmt.Fprint(os.Stderr, "error: failed to identify github user\n")
+			cancel()
+			return
+		}
+		logger.Printf("INFO: Authenticated as user: %s", username)
 	}
-	logger.Printf("INFO: Authenticated as user: %s", username)
 
 	// Set up turn client
 	var turnClient *turn.Client
@@ -809,9 +817,9 @@ type displayConfig struct {
 	httpClient      *http.Client
 	turnClient      *turn.Client
 	lastDisplayHash *string
-	excludedOrgs    []string
 	token           string
 	username        string
+	excludedOrgs    []string
 	blockingOnly    bool
 	verbose         bool
 	includeStale    bool
@@ -820,13 +828,13 @@ type displayConfig struct {
 
 // watchConfig holds configuration for watch mode.
 type watchConfig struct {
-	logger       *log.Logger
 	httpClient   *http.Client
 	turnClient   *turn.Client
-	excludedOrgs []string
+	logger       *log.Logger
+	org          string
 	token        string
 	username     string
-	org          string
+	excludedOrgs []string
 	interval     time.Duration
 	blockingOnly bool
 	notifyMode   bool
