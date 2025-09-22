@@ -1022,9 +1022,17 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 	// Filter stale PRs unless includeStale is true
 	if !includeStale {
 		var filteredPRs []PR
+		staleDuration := 90 * 24 * time.Hour // 90 days
 		for i := range prs {
 			isStale := false
-			if prs[i].TurnResponse != nil {
+
+			// Check if PR is older than 90 days based on UpdatedAt
+			if time.Since(prs[i].UpdatedAt) > staleDuration {
+				isStale = true
+			}
+
+			// Also check TurnResponse tags if available
+			if !isStale && prs[i].TurnResponse != nil {
 				for _, tag := range prs[i].TurnResponse.PRState.Tags {
 					if tag == "stale" {
 						isStale = true
@@ -1032,6 +1040,7 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 					}
 				}
 			}
+
 			if !isStale {
 				filteredPRs = append(filteredPRs, prs[i])
 			}
