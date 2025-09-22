@@ -7,7 +7,7 @@ require github.com/avast/retry-go/v4 v4.6.1
 require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/codeGROOVE-dev/sprinkler v0.0.0-20250827124139-8fa72516d748
-	github.com/ready-to-review/turnclient v0.0.0-20250718014946-bb5bb107649f
+	github.com/codeGROOVE-dev/turnclient v0.0.0-20250922140157-bac36d1bd9f2
 	golang.org/x/term v0.32.0
 )
 
@@ -17,6 +17,8 @@ require (
 	github.com/charmbracelet/x/ansi v0.9.3 // indirect
 	github.com/charmbracelet/x/cellbuf v0.0.13 // indirect
 	github.com/charmbracelet/x/term v0.2.1 // indirect
+	github.com/codeGROOVE-dev/prx v0.0.0-20250908203157-0711b3ec5471 // indirect
+	github.com/codeGROOVE-dev/retry v1.2.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-runewidth v0.0.16 // indirect

@@ -26,7 +26,7 @@ import (
 	"github.com/avast/retry-go/v4"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/codeGROOVE-dev/sprinkler/pkg/client"
-	"github.com/ready-to-review/turnclient/pkg/turn"
+	"github.com/codeGROOVE-dev/turnclient/pkg/turn"
 	"golang.org/x/term"
 )
 
@@ -117,14 +117,13 @@ const (
 	apiUserEndpoint       = "https://api.github.com/user"
 	apiSearchEndpoint     = "https://api.github.com/search/issues"
 	apiPullsEndpoint      = "https://api.github.com/repos/%s/%s/pulls/%d"
-	defaultTurnServerURL  = "https://turn.ready-to-review.dev"
 	defaultSprinklerURL   = "wss://hook.g.robot-army.dev/ws"
-	maxConcurrent         = 20            // Increased for better throughput
-	cacheTTL              = 2 * time.Hour // 2 hours
-	prRefreshCooldownSecs = 1             // Avoid refreshing same PR within 1 second
-	maxOrgNameLength      = 39            // GitHub org name limit
-	minTokenLength        = 10            // Minimum GitHub token length
-	maxIdleConnsPerHost   = 10            // HTTP client setting
+	maxConcurrent         = 20             // Increased for better throughput
+	cacheTTL              = 24 * time.Hour // 24 hours
+	prRefreshCooldownSecs = 1              // Avoid refreshing same PR within 1 second
+	maxOrgNameLength      = 39             // GitHub org name limit
+	minTokenLength        = 10             // Minimum GitHub token length
+	maxIdleConnsPerHost   = 10             // HTTP client setting
 	idleConnTimeout       = 90 * time.Second
 	minPRURLParts         = 6     // Minimum parts in PR URL
 	minOrgURLParts        = 4     // Minimum parts in org URL
@@ -194,6 +193,7 @@ func main() {
 		excludeOrgs  = flag.String("exclude-orgs", "", "Comma-separated list of orgs to exclude")
 		includeStale = flag.Bool("include-stale", false, "Include PRs that haven't been modified in 90 days")
 		user         = flag.String("user", "", "View PRs for specified user instead of authenticated user")
+		noCache      = flag.Bool("no-cache", false, "Disable caching of Turn API responses")
 	)
 	flag.Parse()
 
@@ -249,7 +249,7 @@ func main() {
 
 	// Set up turn client
 	var turnClient *turn.Client
-	turnClient, err = turn.NewClient(defaultTurnServerURL)
+	turnClient, err = turn.NewDefaultClient()
 	if err != nil {
 		logger.Printf("ERROR: Failed to create turn client: %v", err)
 		turnClient = nil
@@ -297,6 +297,7 @@ func main() {
 			org:          "",
 			includeStale: *includeStale,
 			excludedOrgs: excludedOrgs,
+			noCache:      *noCache,
 		}
 		runWatchMode(ctx, cfg)
 	} else {
@@ -306,6 +307,7 @@ func main() {
 			username: username,
 			org:      "",
 			debug:    *verbose,
+			noCache:  *noCache,
 		}
 		cls := &clients{
 			http: httpClient,
@@ -488,7 +490,7 @@ func fetchPRs(ctx context.Context, query *prQuery, logger *log.Logger, cls *clie
 	prs = deduplicatePRs(prs)
 	logger.Printf("Found %d PRs (after deduplication)", len(prs))
 
-	enrichPRsParallel(ctx, query.token, prs, logger, cls.http, cls.turn, query.username, query.debug)
+	enrichPRsParallel(ctx, query.token, prs, logger, cls.http, cls.turn, query.username, query.debug, query.noCache)
 	logger.Printf("INFO: Successfully enriched all %d PRs", len(prs))
 
 	return prs, nil
@@ -574,7 +576,7 @@ func deduplicatePRs(prs []PR) []PR {
 }
 
 func enrichPRsParallel(ctx context.Context, token string, prs []PR, logger *log.Logger,
-	httpClient *http.Client, turnClient *turn.Client, username string, debug bool,
+	httpClient *http.Client, turnClient *turn.Client, username string, debug bool, noCache bool,
 ) {
 	// Simple semaphore pattern - Rob Pike style
 	sem := make(chan struct{}, maxConcurrent)
@@ -591,7 +593,7 @@ func enrichPRsParallel(ctx context.Context, token string, prs []PR, logger *log.
 			}()
 
 			// Ignore non-critical errors - let the app continue
-			if err := enrichPRData(ctx, pr, githubToken, logger, httpClient, turnClient, username, debug); err != nil {
+			if err := enrichPRData(ctx, pr, githubToken, logger, httpClient, turnClient, username, debug, noCache); err != nil {
 				if errors.Is(err, context.Canceled) {
 					return
 				}
@@ -663,6 +665,7 @@ func enrichPRData(
 	turnClient *turn.Client,
 	username string,
 	debug bool,
+	noCache bool,
 ) error {
 	start := time.Now()
 	defer func() {
@@ -679,35 +682,56 @@ func enrichPRData(
 
 	// Enrich with turn server data if available
 	if turnClient == nil {
+		if debug {
+			logger.Printf("Turn client is nil, skipping turn enrichment for PR #%d", pr.Number)
+		}
 		return nil
 	}
-	return enrichWithTurnData(ctx, pr, logger, turnClient, username, debug)
+	if debug {
+		logger.Printf("Calling enrichWithTurnData for PR #%d", pr.Number)
+	}
+	return enrichWithTurnData(ctx, pr, logger, turnClient, username, debug, noCache)
 }
 
-func enrichWithTurnData(ctx context.Context, pr *PR, logger *log.Logger, turnClient *turn.Client, username string, debug bool) error {
+func enrichWithTurnData(ctx context.Context, pr *PR, logger *log.Logger, turnClient *turn.Client, username string, debug bool, noCache bool) error {
+	if debug {
+		logger.Printf("enrichWithTurnData called for PR #%d, URL: %s", pr.Number, pr.HTMLURL)
+	}
+
 	// Validate PR URL before sending to turn server
 	if pr.HTMLURL == "" || !strings.HasPrefix(pr.HTMLURL, "https://github.com/") {
 		logger.Printf("WARNING: Invalid PR URL for turn enrichment: %s", pr.HTMLURL)
 		return nil
 	}
 
-	// Check cache first
-	cachePath := turnCachePath(pr.HTMLURL, pr.UpdatedAt)
-	if cached, found := loadTurnCache(cachePath); found {
-		pr.TurnResponse = cached
-		return nil
+	// Check cache first (unless noCache is enabled)
+	var cachePath string
+	if !noCache {
+		cachePath = turnCachePath(pr.HTMLURL, pr.UpdatedAt)
+		if debug {
+			logger.Printf("Cache path for PR #%d: %s", pr.Number, cachePath)
+		}
+		if cached, found := loadTurnCache(cachePath); found {
+			if debug {
+				logger.Printf("INFO: Cache hit for PR #%d", pr.Number)
+			}
+			pr.TurnResponse = cached
+			return nil
+		}
+
+		// Cache miss
+		if debug {
+			logger.Printf("INFO: Cache miss for PR #%d", pr.Number)
+		}
+	} else if debug {
+		logger.Printf("INFO: Cache disabled (--no-cache) for PR #%d", pr.Number)
 	}
 
-	// Cache miss
-	if debug && cachePath != "" {
-		logger.Printf("INFO: Cache miss for PR #%d", pr.Number)
-	}
-
-	return fetchAndCacheTurnData(ctx, pr, logger, turnClient, username, debug, cachePath)
+	return fetchAndCacheTurnData(ctx, pr, logger, turnClient, username, debug, cachePath, noCache)
 }
 
 func fetchAndCacheTurnData(ctx context.Context, pr *PR, logger *log.Logger,
-	turnClient *turn.Client, username string, debug bool, cachePath string,
+	turnClient *turn.Client, username string, debug bool, cachePath string, noCache bool,
 ) error {
 	turnStart := time.Now()
 	if debug {
@@ -726,28 +750,36 @@ func fetchAndCacheTurnData(ctx context.Context, pr *PR, logger *log.Logger,
 	}
 
 	pr.TurnResponse = turnResponse
-	saveTurnCache(cachePath, turnResponse)
+	if !noCache {
+		saveTurnCache(cachePath, turnResponse)
+	}
 
 	if debug {
-		logDebugTurnResponse(logger, pr.Number, turnResponse, time.Since(turnStart))
+		if err := logDebugTurnResponse(logger, pr.Number, turnResponse, time.Since(turnStart)); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func logDebugTurnResponse(logger *log.Logger, prNumber int, turnResponse *turn.CheckResponse, duration time.Duration) {
+func logDebugTurnResponse(logger *log.Logger, prNumber int, turnResponse *turn.CheckResponse, duration time.Duration) error {
 	logger.Printf("Turn server call for PR #%d took %v", prNumber, duration)
 	responseJSON, err := json.MarshalIndent(turnResponse, "", "  ")
 	if err != nil {
-		logger.Printf("Failed to marshal turn response: %v", err)
-	} else {
-		logger.Printf("Received turnclient response for PR #%d: %s", prNumber, string(responseJSON))
+		logger.Printf("ERROR: Failed to marshal turn response for PR #%d: %v", prNumber, err)
+		// Try to at least log some basic info
+		logger.Printf("Turn response for PR #%d: Analysis.Tags=%v, NextActions=%d",
+			prNumber, turnResponse.Analysis.Tags, len(turnResponse.Analysis.NextAction))
+		return fmt.Errorf("failed to marshal turn response: %w", err)
 	}
+	logger.Printf("Received turnclient response for PR #%d:\n%s", prNumber, string(responseJSON))
+	return nil
 }
 
 func isBlockingOnUser(pr *PR, username string) bool {
 	// If we have turn client data, use that for blocking determination
-	if pr.TurnResponse != nil && pr.TurnResponse.PRState.UnblockAction != nil {
-		_, hasAction := pr.TurnResponse.PRState.UnblockAction[username]
+	if pr.TurnResponse != nil && pr.TurnResponse.Analysis.NextAction != nil {
+		_, hasAction := pr.TurnResponse.Analysis.NextAction[username]
 		return hasAction
 	}
 
@@ -755,6 +787,16 @@ func isBlockingOnUser(pr *PR, username string) bool {
 	for _, reviewer := range pr.RequestedReviewers {
 		if reviewer.Login == username {
 			return true
+		}
+	}
+	return false
+}
+
+func isCriticalBlocker(pr *PR, username string) bool {
+	// Check if user has a critical action
+	if pr.TurnResponse != nil && pr.TurnResponse.Analysis.NextAction != nil {
+		if action, exists := pr.TurnResponse.Analysis.NextAction[username]; exists {
+			return action.Critical
 		}
 	}
 	return false
@@ -806,6 +848,7 @@ type prQuery struct {
 	username string
 	org      string
 	debug    bool
+	noCache  bool
 }
 
 // displayConfig holds configuration for updateDisplay.
@@ -821,6 +864,7 @@ type displayConfig struct {
 	verbose         bool
 	includeStale    bool
 	force           bool
+	noCache         bool
 }
 
 // watchConfig holds configuration for watch mode.
@@ -838,6 +882,7 @@ type watchConfig struct {
 	bell         bool
 	debug        bool
 	includeStale bool
+	noCache      bool
 }
 
 func runWatchMode(ctx context.Context, cfg *watchConfig) {
@@ -866,6 +911,7 @@ func runWatchMode(ctx context.Context, cfg *watchConfig) {
 		verbose:         cfg.debug,
 		includeStale:    cfg.includeStale,
 		force:           true,
+		noCache:         cfg.noCache,
 	}
 	err := updateDisplay(ctx, displayCfg)
 	if err != nil {
@@ -966,6 +1012,7 @@ func updateDisplay(ctx context.Context, cfg *displayConfig) error {
 		username: cfg.username,
 		org:      "",
 		debug:    cfg.verbose,
+		noCache:  cfg.noCache,
 	}
 	cls := &clients{
 		http: cfg.httpClient,
@@ -1030,7 +1077,7 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 
 			// Also check TurnResponse tags if available
 			if !stale && prs[i].TurnResponse != nil {
-				for _, tag := range prs[i].TurnResponse.PRState.Tags {
+				for _, tag := range prs[i].TurnResponse.Analysis.Tags {
 					if tag == "stale" {
 						stale = true
 						break
@@ -1051,25 +1098,31 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 	// Split into incoming and outgoing
 	incoming, outgoing := categorizePRs(prs, username)
 
-	// Count blocking PRs
-	inBlocked := 0
+	// Count blocking PRs - separate critical and non-critical
+	inBlocked := 0  // critical actions only
+	inAwaiting := 0 // non-critical actions
 	for i := range incoming {
-		if isBlockingOnUser(&incoming[i], username) {
+		if isCriticalBlocker(&incoming[i], username) {
 			inBlocked++
+		} else if isBlockingOnUser(&incoming[i], username) {
+			inAwaiting++
 		}
 	}
 
-	outBlocked := 0
+	outBlocked := 0  // critical actions only
+	outAwaiting := 0 // non-critical actions
 	for i := range outgoing {
-		if isBlockingOnUser(&outgoing[i], username) {
+		if isCriticalBlocker(&outgoing[i], username) {
 			outBlocked++
+		} else if isBlockingOnUser(&outgoing[i], username) {
+			outAwaiting++
 		}
 	}
 
 	output.WriteString("\n")
 
 	// Incoming PRs with integrated header
-	if len(incoming) > 0 && (!blockingOnly || inBlocked > 0) {
+	if len(incoming) > 0 && (!blockingOnly || inBlocked > 0 || inAwaiting > 0) {
 		// Header with counts - proper singular/plural
 		prText := "PR"
 		if len(incoming) != 1 {
@@ -1080,9 +1133,17 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 			output.WriteString(", ")
 			blockText := "blocked on YOU"
 			output.WriteString(lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#E5484D")). // Red for blocked count
+				Foreground(lipgloss.Color("#E5484D")). // Red for critical blocked count
 				Bold(true).
 				Render(fmt.Sprintf("%d %s", inBlocked, blockText)))
+		}
+		if inAwaiting > 0 {
+			output.WriteString(", ")
+			awaitText := "awaiting your input"
+			output.WriteString(lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#FFB224")). // Yellow for awaiting input
+				Bold(true).
+				Render(fmt.Sprintf("%d %s", inAwaiting, awaitText)))
 		}
 		output.WriteString(":\n")
 
@@ -1095,7 +1156,7 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 	}
 
 	// Outgoing PRs with integrated header
-	if len(outgoing) > 0 && (!blockingOnly || outBlocked > 0) {
+	if len(outgoing) > 0 && (!blockingOnly || outBlocked > 0 || outAwaiting > 0) {
 		if len(incoming) > 0 {
 			output.WriteString("\n")
 		}
@@ -1116,6 +1177,14 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 				Bold(true).
 				Render(fmt.Sprintf("%d %s", outBlocked, blockText)))
 		}
+		if outAwaiting > 0 {
+			output.WriteString(", ")
+			awaitText := "awaiting your input"
+			output.WriteString(lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#FFB224")).
+				Bold(true).
+				Render(fmt.Sprintf("%d %s", outAwaiting, awaitText)))
+		}
 		output.WriteString(":\n")
 
 		for i := range outgoing {
@@ -1126,7 +1195,7 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 		}
 	}
 
-	if blockingOnly && inBlocked == 0 && outBlocked == 0 {
+	if blockingOnly && inBlocked == 0 && inAwaiting == 0 && outBlocked == 0 && outAwaiting == 0 {
 		// Show nothing when no PRs are blocking
 		return ""
 	}
@@ -1150,11 +1219,20 @@ func formatPR(pr *PR, username string) string {
 	// Get terminal width for dynamic truncation
 	termWidth := terminalWidth()
 
-	// Blocking indicator - red bullet if blocking, subtle indent otherwise
+	// Blocking indicator - differentiate between critical and regular actions
 	isBlocking := isBlockingOnUser(pr, username)
-	if isBlocking {
+	isCritical := isCriticalBlocker(pr, username)
+
+	if isCritical {
+		// Red triangle for critical blocker
 		output.WriteString(lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#E5484D")). // Modern red
+			Bold(true).
+			Render("‣ "))
+	} else if isBlocking {
+		// Yellow bullet for regular next action
+		output.WriteString(lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFB224")). // Yellow/amber
 			Bold(true).
 			Render("• "))
 	} else {
@@ -1203,6 +1281,59 @@ func formatPR(pr *PR, username string) string {
 			Foreground(lipgloss.Color("#3E63DD")).
 			Render(pr.HTMLURL)
 		output.WriteString(blueURL)
+	}
+
+	// Add NextAction kinds if available
+	if pr.TurnResponse != nil && pr.TurnResponse.Analysis.NextAction != nil {
+		var actionKinds []string
+		var userHasAction bool
+		var userActionCritical bool
+
+		// Check if current user has actions - if so, only show those
+		if userAction, hasUserAction := pr.TurnResponse.Analysis.NextAction[username]; hasUserAction {
+			// Only show current user's action
+			actionKinds = append(actionKinds, string(userAction.Kind))
+			userHasAction = true
+			userActionCritical = userAction.Critical
+		} else {
+			// Show all unique action kinds from all users
+			seen := make(map[string]bool)
+			for _, action := range pr.TurnResponse.Analysis.NextAction {
+				kind := string(action.Kind)
+				if !seen[kind] {
+					seen[kind] = true
+					actionKinds = append(actionKinds, kind)
+				}
+			}
+		}
+
+		if len(actionKinds) > 0 {
+			// Dark grey emdash
+			output.WriteString(lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#6B6B6B")). // Dark grey
+				Render(" — "))
+
+			// Color the action based on whether it's the user's action and its criticality
+			actionText := strings.Join(actionKinds, " ")
+			if userHasAction {
+				if userActionCritical {
+					// Red for critical user action
+					output.WriteString(lipgloss.NewStyle().
+						Foreground(lipgloss.Color("#E5484D")).
+						Render(actionText))
+				} else {
+					// Yellow for non-critical user action
+					output.WriteString(lipgloss.NewStyle().
+						Foreground(lipgloss.Color("#FFB224")).
+						Render(actionText))
+				}
+			} else {
+				// Dark grey for others' actions
+				output.WriteString(lipgloss.NewStyle().
+					Foreground(lipgloss.Color("#6B6B6B")).
+					Render(actionText))
+			}
+		}
 	}
 
 	output.WriteString("\n")
