@@ -148,7 +148,7 @@ func turnCachePath(urlPath string, updatedAt time.Time) string {
 
 	// Simple hash for filename
 	h := sha256.Sum256([]byte(urlPath + updatedAt.Format(time.RFC3339)))
-	return filepath.Join(dir, "github-pr-notifier", "turn-cache", hex.EncodeToString(h[:8])+".json")
+	return filepath.Join(dir, "prs", "turn-cache", hex.EncodeToString(h[:8])+".json")
 }
 
 func loadTurnCache(path string) (*turn.CheckResponse, bool) {
@@ -200,7 +200,7 @@ func main() {
 	// Set up logger
 	var logger *log.Logger
 	if *verbose {
-		logger = log.New(os.Stderr, "[github-pr-notifier] ", log.Ltime)
+		logger = log.New(os.Stderr, "[prs] ", log.Ltime)
 	} else {
 		logger = log.New(io.Discard, "", 0)
 	}
@@ -369,7 +369,7 @@ func currentUser(ctx context.Context, token string, logger *log.Logger, httpClie
 
 			req.Header.Set("Authorization", "token "+token)
 			req.Header.Set("Accept", "application/vnd.github.v3+json")
-			req.Header.Set("User-Agent", "github-pr-notifier-cli")
+			req.Header.Set("User-Agent", "prs-cli")
 
 			resp, err := httpClient.Do(req)
 			if err != nil {
@@ -512,7 +512,7 @@ func makeGitHubSearchRequest(ctx context.Context, query, token string, httpClien
 
 	req.Header.Set("Authorization", "token "+token)
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	req.Header.Set("User-Agent", "github-pr-notifier-cli")
+	req.Header.Set("User-Agent", "prs-cli")
 	req.Header.Set("X-Github-Api-Version", "2022-11-28")
 
 	start := time.Now()
