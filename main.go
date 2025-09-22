@@ -999,50 +999,50 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 
 	// Filter out excluded orgs
 	if len(excludedOrgs) > 0 {
-		var filteredPRs []PR
+		var filtered []PR
 		for i := range prs {
 			excluded := false
-			prOrg := orgFromURL(prs[i].HTMLURL)
-			for _, excludeOrg := range excludedOrgs {
-				if prOrg == excludeOrg {
+			org := orgFromURL(prs[i].HTMLURL)
+			for _, exc := range excludedOrgs {
+				if org == exc {
 					excluded = true
 					break
 				}
 			}
 			if !excluded {
-				filteredPRs = append(filteredPRs, prs[i])
+				filtered = append(filtered, prs[i])
 			}
 		}
-		prs = filteredPRs
+		prs = filtered
 	}
 
 	// Filter stale PRs unless includeStale is true
 	if !includeStale {
-		var filteredPRs []PR
-		staleDuration := stalePRDays * 24 * time.Hour
+		var filtered []PR
+		staleAge := stalePRDays * 24 * time.Hour
 		for i := range prs {
-			isStale := false
+			stale := false
 
 			// Check if PR is older than 90 days based on UpdatedAt
-			if time.Since(prs[i].UpdatedAt) > staleDuration {
-				isStale = true
+			if time.Since(prs[i].UpdatedAt) > staleAge {
+				stale = true
 			}
 
 			// Also check TurnResponse tags if available
-			if !isStale && prs[i].TurnResponse != nil {
+			if !stale && prs[i].TurnResponse != nil {
 				for _, tag := range prs[i].TurnResponse.PRState.Tags {
 					if tag == "stale" {
-						isStale = true
+						stale = true
 						break
 					}
 				}
 			}
 
-			if !isStale {
-				filteredPRs = append(filteredPRs, prs[i])
+			if !stale {
+				filtered = append(filtered, prs[i])
 			}
 		}
-		prs = filteredPRs
+		prs = filtered
 	}
 
 	// Sort PRs by most recently updated
@@ -1052,37 +1052,37 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 	incoming, outgoing := categorizePRs(prs, username)
 
 	// Count blocking PRs
-	incomingBlockingCount := 0
+	inBlocked := 0
 	for i := range incoming {
 		if isBlockingOnUser(&incoming[i], username) {
-			incomingBlockingCount++
+			inBlocked++
 		}
 	}
 
-	outgoingBlockingCount := 0
+	outBlocked := 0
 	for i := range outgoing {
 		if isBlockingOnUser(&outgoing[i], username) {
-			outgoingBlockingCount++
+			outBlocked++
 		}
 	}
 
 	output.WriteString("\n")
 
 	// Incoming PRs with integrated header
-	if len(incoming) > 0 && (!blockingOnly || incomingBlockingCount > 0) {
+	if len(incoming) > 0 && (!blockingOnly || inBlocked > 0) {
 		// Header with counts - proper singular/plural
 		prText := "PR"
 		if len(incoming) != 1 {
 			prText = "PRs"
 		}
 		output.WriteString(fmt.Sprintf("incoming - %d %s", len(incoming), prText))
-		if incomingBlockingCount > 0 {
+		if inBlocked > 0 {
 			output.WriteString(", ")
 			blockText := "blocked on YOU"
 			output.WriteString(lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#E5484D")). // Red for blocked count
 				Bold(true).
-				Render(fmt.Sprintf("%d %s", incomingBlockingCount, blockText)))
+				Render(fmt.Sprintf("%d %s", inBlocked, blockText)))
 		}
 		output.WriteString(":\n")
 
@@ -1095,7 +1095,7 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 	}
 
 	// Outgoing PRs with integrated header
-	if len(outgoing) > 0 && (!blockingOnly || outgoingBlockingCount > 0) {
+	if len(outgoing) > 0 && (!blockingOnly || outBlocked > 0) {
 		if len(incoming) > 0 {
 			output.WriteString("\n")
 		}
@@ -1108,13 +1108,13 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 		output.WriteString(lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#8B8B8B")). // Gray for outgoing header
 			Render(fmt.Sprintf("outgoing - %d %s", len(outgoing), prText)))
-		if outgoingBlockingCount > 0 {
+		if outBlocked > 0 {
 			output.WriteString(", ")
 			blockText := "blocked on YOU"
 			output.WriteString(lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#E5484D")).
 				Bold(true).
-				Render(fmt.Sprintf("%d %s", outgoingBlockingCount, blockText)))
+				Render(fmt.Sprintf("%d %s", outBlocked, blockText)))
 		}
 		output.WriteString(":\n")
 
@@ -1126,7 +1126,7 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 		}
 	}
 
-	if blockingOnly && incomingBlockingCount == 0 && outgoingBlockingCount == 0 {
+	if blockingOnly && inBlocked == 0 && outBlocked == 0 {
 		// Show nothing when no PRs are blocking
 		return ""
 	}
