@@ -137,6 +137,7 @@ const (
 	titlePadding          = 5     // Space between title and URL
 	minTitleLength        = 20    // Minimum title display length
 	cacheFileMode         = 0o644 // File permissions for cache files
+	stalePRDays           = 90    // Days before a PR is considered stale
 )
 
 // turnCache handles caching of Turn API responses.
@@ -537,10 +538,10 @@ func parseSearchResponse(resp *http.Response) ([]PR, error) {
 			resetTime := resp.Header.Get("X-Ratelimit-Reset")
 			return nil, fmt.Errorf("github api rate limit exceeded, resets at %s", resetTime)
 		}
-		return nil, handleHTTPError(resp, "github api access forbidden")
+		return nil, fmt.Errorf("github api access forbidden: status %d", resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, handleHTTPError(resp, "github api error")
+		return nil, fmt.Errorf("github api error: status %d", resp.StatusCode)
 	}
 
 	var result SearchResult
@@ -549,10 +550,6 @@ func parseSearchResponse(resp *http.Response) ([]PR, error) {
 	}
 
 	return result.Items, nil
-}
-
-func handleHTTPError(resp *http.Response, message string) error {
-	return fmt.Errorf("%s: status %d", message, resp.StatusCode)
 }
 
 func deduplicatePRs(prs []PR) []PR {
@@ -1022,7 +1019,7 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 	// Filter stale PRs unless includeStale is true
 	if !includeStale {
 		var filteredPRs []PR
-		staleDuration := 90 * 24 * time.Hour // 90 days
+		staleDuration := stalePRDays * 24 * time.Hour
 		for i := range prs {
 			isStale := false
 
@@ -1129,7 +1126,7 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 		}
 	}
 
-	if blockingOnly && incomingBlockingCount == 0 {
+	if blockingOnly && incomingBlockingCount == 0 && outgoingBlockingCount == 0 {
 		// Show nothing when no PRs are blocking
 		return ""
 	}
