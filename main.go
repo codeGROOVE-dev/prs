@@ -118,12 +118,12 @@ const (
 	apiSearchEndpoint     = "https://api.github.com/search/issues"
 	apiPullsEndpoint      = "https://api.github.com/repos/%s/%s/pulls/%d"
 	defaultSprinklerURL   = "wss://hook.g.robot-army.dev/ws"
-	maxConcurrent         = 20             // Increased for better throughput
-	cacheTTL              = 24 * time.Hour // 24 hours
-	prRefreshCooldownSecs = 1              // Avoid refreshing same PR within 1 second
-	maxOrgNameLength      = 39             // GitHub org name limit
-	minTokenLength        = 10             // Minimum GitHub token length
-	maxIdleConnsPerHost   = 10             // HTTP client setting
+	maxConcurrent         = 20                  // Increased for better throughput
+	cacheTTL              = 10 * 24 * time.Hour // 10 days
+	prRefreshCooldownSecs = 1                   // Avoid refreshing same PR within 1 second
+	maxOrgNameLength      = 39                  // GitHub org name limit
+	minTokenLength        = 10                  // Minimum GitHub token length
+	maxIdleConnsPerHost   = 10                  // HTTP client setting
 	idleConnTimeout       = 90 * time.Second
 	minPRURLParts         = 6     // Minimum parts in PR URL
 	minOrgURLParts        = 4     // Minimum parts in org URL
@@ -1228,7 +1228,7 @@ func formatPR(pr *PR, username string) string {
 		output.WriteString(lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#E5484D")). // Modern red
 			Bold(true).
-			Render("‣ "))
+			Render("► "))
 	} else if isBlocking {
 		// Yellow bullet for regular next action
 		output.WriteString(lipgloss.NewStyle().
@@ -1285,37 +1285,42 @@ func formatPR(pr *PR, username string) string {
 
 	// Add NextAction kinds if available
 	if pr.TurnResponse != nil && pr.TurnResponse.Analysis.NextAction != nil {
-		var actionKinds []string
-		var userHasAction bool
+		var userActionKinds []string
+		var otherCriticalKinds []string
 		var userActionCritical bool
+		seen := make(map[string]bool)
 
-		// Check if current user has actions - if so, only show those
+		// First, collect current user's actions
 		if userAction, hasUserAction := pr.TurnResponse.Analysis.NextAction[username]; hasUserAction {
-			// Only show current user's action
-			actionKinds = append(actionKinds, string(userAction.Kind))
-			userHasAction = true
-			userActionCritical = userAction.Critical
-		} else {
-			// Show all unique action kinds from all users
-			seen := make(map[string]bool)
-			for _, action := range pr.TurnResponse.Analysis.NextAction {
+			kind := string(userAction.Kind)
+			if !seen[kind] {
+				userActionKinds = append(userActionKinds, kind)
+				seen[kind] = true
+				userActionCritical = userAction.Critical
+			}
+		}
+
+		// Then collect critical actions from other users (avoiding duplicates)
+		for user, action := range pr.TurnResponse.Analysis.NextAction {
+			if user != username && action.Critical {
 				kind := string(action.Kind)
 				if !seen[kind] {
+					otherCriticalKinds = append(otherCriticalKinds, kind)
 					seen[kind] = true
-					actionKinds = append(actionKinds, kind)
 				}
 			}
 		}
 
-		if len(actionKinds) > 0 {
+		// Display actions if any exist
+		if len(userActionKinds) > 0 || len(otherCriticalKinds) > 0 {
 			// Dark grey emdash
 			output.WriteString(lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#6B6B6B")). // Dark grey
 				Render(" — "))
 
-			// Color the action based on whether it's the user's action and its criticality
-			actionText := strings.Join(actionKinds, " ")
-			if userHasAction {
+			// Display user's actions first with appropriate color
+			if len(userActionKinds) > 0 {
+				actionText := strings.Join(userActionKinds, " ")
 				if userActionCritical {
 					// Red for critical user action
 					output.WriteString(lipgloss.NewStyle().
@@ -1327,8 +1332,14 @@ func formatPR(pr *PR, username string) string {
 						Foreground(lipgloss.Color("#FFB224")).
 						Render(actionText))
 				}
-			} else {
-				// Dark grey for others' actions
+			}
+
+			// Display other critical actions in dark grey
+			if len(otherCriticalKinds) > 0 {
+				if len(userActionKinds) > 0 {
+					output.WriteString(" ") // Space between user and other actions
+				}
+				actionText := strings.Join(otherCriticalKinds, " ")
 				output.WriteString(lipgloss.NewStyle().
 					Foreground(lipgloss.Color("#6B6B6B")).
 					Render(actionText))
