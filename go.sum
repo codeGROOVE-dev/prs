@@ -12,8 +12,14 @@ github.com/charmbracelet/x/cellbuf v0.0.13 h1:/KBBKHuVRbq1lYx5BzEHBAFBP8VcQzJejZ
 github.com/charmbracelet/x/cellbuf v0.0.13/go.mod h1:xe0nKWGd3eJgtqZRaN9RjMtK7xUYchjzPr7q6kcvCCs=
 github.com/charmbracelet/x/term v0.2.1 h1:AQeHeLZ1OqSXhrAWpYUtZyX1T3zVxfpZuEQMIQaGIAQ=
 github.com/charmbracelet/x/term v0.2.1/go.mod h1:oQ4enTYFV7QN4m0i9mzHrViD7TQKvNEEkHUMCmsxdUg=
+github.com/codeGROOVE-dev/prx v0.0.0-20250908203157-0711b3ec5471 h1:CbUa70O+iNC9rPk5aoZGs/RZbpmPyfNydv5ncKLdOvk=
+github.com/codeGROOVE-dev/prx v0.0.0-20250908203157-0711b3ec5471/go.mod h1:7qLbi18baOyS8yO/6/64SBIqtyzSzLFdsDST15NPH3w=
+github.com/codeGROOVE-dev/retry v1.2.0 h1:xYpYPX2PQZmdHwuiQAGGzsBm392xIMl4nfMEFApQnu8=
+github.com/codeGROOVE-dev/retry v1.2.0/go.mod h1:8OgefgV1XP7lzX2PdKlCXILsYKuz6b4ZpHa/20iLi8E=
 github.com/codeGROOVE-dev/sprinkler v0.0.0-20250827124139-8fa72516d748 h1:5RGwu9DI70NnLWvfNiM9oR/Jj0clYc7Pnfd3Sa1rcw4=
 github.com/codeGROOVE-dev/sprinkler v0.0.0-20250827124139-8fa72516d748/go.mod h1:F8FIfuDdk3rkslIaCASnEt61A2lU8F+9lTPiFzFlIQ8=
+github.com/codeGROOVE-dev/turnclient v0.0.0-20250922140157-bac36d1bd9f2 h1:iMC3tTx0oRrkJjqs4IWw7EEN1sC1ZViG9n9ewk2P3ps=
+github.com/codeGROOVE-dev/turnclient v0.0.0-20250922140157-bac36d1bd9f2/go.mod h1:7lBF4vS6T+D1rNjmJ+CNVrXALQvdwNfBVEy7vhIQtYk=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/lucasb-eyer/go-colorful v1.2.0 h1:1nnpGOrhyZZuNyfu1QjKiUICQ74+3FNCN69Aj6K7nkY=
@@ -26,8 +32,6 @@ github.com/muesli/termenv v0.16.0 h1:S5AlUN9dENB57rsbnkPyfdGuWIlkmzJjbFf0Tf5FWUc
 github.com/muesli/termenv v0.16.0/go.mod h1:ZRfOIKPFDYQoDFF4Olj7/QJbW60Ol/kL1pU3VfY/Cnk=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
-github.com/ready-to-review/turnclient v0.0.0-20250718014946-bb5bb107649f h1:l+hWs9J3BUQ3UkiYmgciJGSouivJl4ZAagmM936mnEg=
-github.com/ready-to-review/turnclient v0.0.0-20250718014946-bb5bb107649f/go.mod h1:KVCVaRAn+IFk8QpXsHeJxjT+rxyYOsG8hhpDq5JWNlU=
 github.com/rivo/uniseg v0.2.0/go.mod h1:J6wj4VEh+S6ZtnVlnTBMWIodfgj8LQOQFoIToxlJtxc=
 github.com/rivo/uniseg v0.4.7 h1:WUdvkW8uEhrYfLC4ZzdpI2ztxP1I582+49Oc5Mq64VQ=
 github.com/rivo/uniseg v0.4.7/go.mod h1:FN3SvrM+Zdj16jyLfmOkMNblXMcoc8DfTHruCPUcx88=
