@@ -231,11 +231,14 @@ func main() {
 	}
 	logger.Print("INFO: Successfully retrieved GitHub token")
 
-	// Determine the username to use - either specified via --user or the authenticated user
+	// Determine the username to use - priority: --user flag, GITHUB_USER env, authenticated user
 	var username string
 	if *user != "" {
 		username = *user
-		logger.Printf("INFO: Using specified user: %s", username)
+		logger.Printf("INFO: Using specified user from --user flag: %s", username)
+	} else if envUser := os.Getenv("GITHUB_USER"); envUser != "" {
+		username = envUser
+		logger.Printf("INFO: Using user from GITHUB_USER environment variable: %s", username)
 	} else {
 		username, err = currentUser(ctx, token, logger, httpClient)
 		if err != nil {

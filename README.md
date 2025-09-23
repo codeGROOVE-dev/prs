@@ -42,3 +42,7 @@ Colors disabled with `NO_COLOR=1`.
 Due to GitHub webhook limitations, real-time updates are only available for GitHub orgs that install the [Ready to Review](https://github.com/apps/ready-to-review-beta) GitHub app.
 
 Without the app, PRs are updated every minute, which should be enough for anyone TBH.
+
+## GUI
+
+Prefer a menu-bar UI? Check out https://github.com/codeGROOVE-dev/goose
