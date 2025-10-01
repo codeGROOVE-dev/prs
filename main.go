@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -117,7 +118,6 @@ const (
 	apiUserEndpoint       = "https://api.github.com/user"
 	apiSearchEndpoint     = "https://api.github.com/search/issues"
 	apiPullsEndpoint      = "https://api.github.com/repos/%s/%s/pulls/%d"
-	defaultSprinklerURL   = "wss://hook.g.robot-army.dev/ws"
 	maxConcurrent         = 20                  // Increased for better throughput
 	cacheTTL              = 10 * 24 * time.Hour // 10 days
 	prRefreshCooldownSecs = 1                   // Avoid refreshing same PR within 1 second
@@ -231,11 +231,14 @@ func main() {
 	}
 	logger.Print("INFO: Successfully retrieved GitHub token")
 
-	// Determine the username to use - either specified via --user or the authenticated user
+	// Determine the username to use - priority: --user flag, GITHUB_USER env, authenticated user
 	var username string
 	if *user != "" {
 		username = *user
-		logger.Printf("INFO: Using specified user: %s", username)
+		logger.Printf("INFO: Using specified user from --user flag: %s", username)
+	} else if envUser := os.Getenv("GITHUB_USER"); envUser != "" {
+		username = envUser
+		logger.Printf("INFO: Using user from GITHUB_USER environment variable: %s", username)
 	} else {
 		username, err = currentUser(ctx, token, logger, httpClient)
 		if err != nil {
@@ -922,21 +925,25 @@ func runWatchMode(ctx context.Context, cfg *watchConfig) {
 
 	// Start WebSocket monitoring
 	go func() {
-		// Redirect standard log output to discard when not verbose
-		// This suppresses sprinkler library logs
-		if !cfg.debug {
-			log.SetOutput(io.Discard)
-			defer log.SetOutput(os.Stderr) // Restore on exit
+		// Create a custom logger for sprinkler client
+		var sprinklerLogger *slog.Logger
+		if cfg.debug {
+			// Use stderr with text handler for verbose mode
+			sprinklerLogger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+		} else {
+			// Discard all logs in non-verbose mode
+			sprinklerLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
 		}
 
 		config := client.Config{
-			ServerURL:      defaultSprinklerURL,
+			ServerURL:      "wss://" + client.DefaultServerAddress + "/ws",
 			Token:          cfg.token,
 			Organization:   "*",
 			EventTypes:     []string{"*"},
 			UserEventsOnly: false,
 			Verbose:        cfg.debug,
 			NoReconnect:    false,
+			Logger:         sprinklerLogger,
 			OnConnect: func() {
 				cfg.logger.Println("✓ WebSocket connected")
 			},
