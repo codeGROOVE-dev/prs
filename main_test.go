@@ -248,6 +248,27 @@ func TestCategorizePRs(t *testing.T) {
 	}
 }
 
+// countPRLines counts PR lines in a section by looking for bullet prefixes.
+func countPRLines(output, sectionHeader, nextSection string) int {
+	lines := strings.Split(output, "\n")
+	sectionStarted := false
+	count := 0
+
+	for _, line := range lines {
+		if strings.Contains(line, sectionHeader) {
+			sectionStarted = true
+			continue
+		}
+		if nextSection != "" && strings.Contains(line, nextSection) {
+			break
+		}
+		if sectionStarted && (strings.HasPrefix(line, "• ") || strings.HasPrefix(line, "► ") || strings.HasPrefix(line, "  ")) {
+			count++
+		}
+	}
+	return count
+}
+
 func TestGeneratePRDisplayBlockedFlag(t *testing.T) {
 	username := "alice"
 
@@ -344,7 +365,7 @@ func TestGeneratePRDisplayBlockedFlag(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			output := generatePRDisplay(tt.prs, username, tt.blockingOnly, false, true, nil)
+			output := generatePRDisplay(tt.prs, username, tt.blockingOnly, true, nil)
 
 			// Debug output for failing test
 			if tt.name == "blocked mode with only outgoing blocked" {
@@ -373,39 +394,14 @@ func TestGeneratePRDisplayBlockedFlag(t *testing.T) {
 
 			// Count actual PRs shown in each section
 			if tt.expectIncoming {
-				incomingLines := 0
-				lines := strings.Split(output, "\n")
-				incomingStarted := false
-				for _, line := range lines {
-					if strings.Contains(line, "incoming -") {
-						incomingStarted = true
-						continue
-					}
-					if strings.Contains(line, "outgoing -") {
-						break
-					}
-					if incomingStarted && (strings.HasPrefix(line, "• ") || strings.HasPrefix(line, "  ")) {
-						incomingLines++
-					}
-				}
+				incomingLines := countPRLines(output, "incoming -", "outgoing -")
 				if incomingLines != tt.expectIncomingCount {
 					t.Errorf("Expected %d incoming PRs shown, got %d", tt.expectIncomingCount, incomingLines)
 				}
 			}
 
 			if tt.expectOutgoing {
-				outgoingLines := 0
-				lines := strings.Split(output, "\n")
-				outgoingStarted := false
-				for _, line := range lines {
-					if strings.Contains(line, "outgoing -") {
-						outgoingStarted = true
-						continue
-					}
-					if outgoingStarted && (strings.HasPrefix(line, "• ") || strings.HasPrefix(line, "  ")) {
-						outgoingLines++
-					}
-				}
+				outgoingLines := countPRLines(output, "outgoing -", "")
 				if outgoingLines != tt.expectOutgoingCount {
 					t.Errorf("Expected %d outgoing PRs shown, got %d", tt.expectOutgoingCount, outgoingLines)
 				}

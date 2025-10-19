@@ -326,7 +326,7 @@ func main() {
 			cancel()
 			return
 		}
-		output := generatePRDisplay(prs, username, *blocked, *verbose, *includeStale, excludedOrgs)
+		output := generatePRDisplay(prs, username, *blocked, *includeStale, excludedOrgs)
 		if output != "" {
 			fmt.Print(output)
 		}
@@ -496,7 +496,18 @@ func fetchPRs(ctx context.Context, query *prQuery, logger *log.Logger, cls *clie
 	enrichPRsParallel(ctx, query.token, prs, logger, cls.http, cls.turn, query.username, query.debug, query.noCache)
 	logger.Printf("INFO: Successfully enriched all %d PRs", len(prs))
 
-	return prs, nil
+	// Filter out closed/merged PRs (can happen due to GitHub search lag or stale cache)
+	openPRs := make([]PR, 0, len(prs))
+	for i := range prs {
+		if prs[i].State == "open" {
+			openPRs = append(openPRs, prs[i])
+		}
+	}
+	if len(openPRs) != len(prs) {
+		logger.Printf("Filtered out %d closed/merged PRs", len(prs)-len(openPRs))
+	}
+
+	return openPRs, nil
 }
 
 func makeGitHubSearchRequest(ctx context.Context, query, token string, httpClient *http.Client, logger *log.Logger) (*http.Response, error) {
@@ -586,23 +597,22 @@ func enrichPRsParallel(ctx context.Context, token string, prs []PR, logger *log.
 	var wg sync.WaitGroup
 
 	for i := range prs {
-		wg.Add(1)
 		sem <- struct{}{} // acquire semaphore
+		pr := &prs[i]
 
-		go func(pr *PR, githubToken string) {
+		wg.Go(func() {
 			defer func() {
 				<-sem // release semaphore
-				wg.Done()
 			}()
 
 			// Ignore non-critical errors - let the app continue
-			if err := enrichPRData(ctx, pr, githubToken, logger, httpClient, turnClient, username, debug, noCache); err != nil {
+			if err := enrichPRData(ctx, pr, token, logger, httpClient, turnClient, username, debug, noCache); err != nil {
 				if errors.Is(err, context.Canceled) {
 					return
 				}
 				logger.Printf("WARNING: Failed to enrich PR #%d: %v", pr.Number, err)
 			}
-		}(&prs[i], token)
+		})
 	}
 
 	wg.Wait()
@@ -932,7 +942,7 @@ func runWatchMode(ctx context.Context, cfg *watchConfig) {
 			sprinklerLogger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 		} else {
 			// Discard all logs in non-verbose mode
-			sprinklerLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
+			sprinklerLogger = slog.New(slog.DiscardHandler)
 		}
 
 		config := client.Config{
@@ -1031,7 +1041,7 @@ func updateDisplay(ctx context.Context, cfg *displayConfig) error {
 	}
 
 	// Generate display output
-	output := generatePRDisplay(prs, cfg.username, cfg.blockingOnly, cfg.verbose, cfg.includeStale, cfg.excludedOrgs)
+	output := generatePRDisplay(prs, cfg.username, cfg.blockingOnly, cfg.includeStale, cfg.excludedOrgs)
 
 	// Check if display has changed
 	currentHash := fmt.Sprintf("%x", sha256.Sum256([]byte(output)))
@@ -1048,55 +1058,123 @@ func updateDisplay(ctx context.Context, cfg *displayConfig) error {
 	return nil
 }
 
-func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, includeStale bool, excludedOrgs []string) string {
-	var output strings.Builder
+// filterExcludedOrgs removes PRs from excluded organizations.
+func filterExcludedOrgs(prs []PR, excludedOrgs []string) []PR {
+	if len(excludedOrgs) == 0 {
+		return prs
+	}
 
-	// Filter out excluded orgs
-	if len(excludedOrgs) > 0 {
-		var filtered []PR
-		for i := range prs {
-			excluded := false
-			org := orgFromURL(prs[i].HTMLURL)
-			for _, exc := range excludedOrgs {
-				if org == exc {
-					excluded = true
+	filtered := make([]PR, 0, len(prs))
+	for i := range prs {
+		excluded := false
+		org := orgFromURL(prs[i].HTMLURL)
+		for _, exc := range excludedOrgs {
+			if org == exc {
+				excluded = true
+				break
+			}
+		}
+		if !excluded {
+			filtered = append(filtered, prs[i])
+		}
+	}
+	return filtered
+}
+
+// filterStalePRs removes PRs that are considered stale.
+func filterStalePRs(prs []PR) []PR {
+	filtered := make([]PR, 0, len(prs))
+	staleAge := stalePRDays * 24 * time.Hour
+	for i := range prs {
+		stale := false
+
+		// Check if PR is older than 90 days based on UpdatedAt
+		if time.Since(prs[i].UpdatedAt) > staleAge {
+			stale = true
+		}
+
+		// Also check TurnResponse tags if available
+		if !stale && prs[i].TurnResponse != nil {
+			for _, tag := range prs[i].TurnResponse.Analysis.Tags {
+				if tag == "stale" {
+					stale = true
 					break
 				}
 			}
-			if !excluded {
-				filtered = append(filtered, prs[i])
-			}
 		}
-		prs = filtered
+
+		if !stale {
+			filtered = append(filtered, prs[i])
+		}
+	}
+	return filtered
+}
+
+// countBlockingPRs counts how many PRs are blocking on the user.
+// Returns blocked (critical) and awaiting (non-critical) counts.
+func countBlockingPRs(prs []PR, username string) (blocked, awaiting int) {
+	for i := range prs {
+		if isCriticalBlocker(&prs[i], username) {
+			blocked++
+		} else if isBlockingOnUser(&prs[i], username) {
+			awaiting++
+		}
+	}
+	return blocked, awaiting
+}
+
+// formatPRListHeader generates a header for a PR list with counts.
+func formatPRListHeader(prCount, blocked, awaiting int, isOutgoing bool) string {
+	var output strings.Builder
+
+	// Proper singular/plural for PRs
+	prText := "PR"
+	if prCount != 1 {
+		prText = "PRs"
 	}
 
-	// Filter stale PRs unless includeStale is true
+	// Base text - gray for outgoing
+	baseText := fmt.Sprintf("incoming - %d %s", prCount, prText)
+	if isOutgoing {
+		baseText = fmt.Sprintf("outgoing - %d %s", prCount, prText)
+		output.WriteString(lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#8B8B8B")).
+			Render(baseText))
+	} else {
+		output.WriteString(baseText)
+	}
+
+	// Add blocked count
+	if blocked > 0 {
+		output.WriteString(", ")
+		blockText := "blocked on YOU"
+		output.WriteString(lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#E5484D")).
+			Bold(true).
+			Render(fmt.Sprintf("%d %s", blocked, blockText)))
+	}
+
+	// Add awaiting count
+	if awaiting > 0 {
+		output.WriteString(", ")
+		awaitText := "awaiting your input"
+		output.WriteString(lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFB224")).
+			Bold(true).
+			Render(fmt.Sprintf("%d %s", awaiting, awaitText)))
+	}
+
+	output.WriteString(":\n")
+	return output.String()
+}
+
+func generatePRDisplay(prs []PR, username string, blockingOnly, includeStale bool, excludedOrgs []string) string {
+	var output strings.Builder
+
+	// Filter PRs
+	prs = filterExcludedOrgs(prs, excludedOrgs)
 	if !includeStale {
-		var filtered []PR
-		staleAge := stalePRDays * 24 * time.Hour
-		for i := range prs {
-			stale := false
-
-			// Check if PR is older than 90 days based on UpdatedAt
-			if time.Since(prs[i].UpdatedAt) > staleAge {
-				stale = true
-			}
-
-			// Also check TurnResponse tags if available
-			if !stale && prs[i].TurnResponse != nil {
-				for _, tag := range prs[i].TurnResponse.Analysis.Tags {
-					if tag == "stale" {
-						stale = true
-						break
-					}
-				}
-			}
-
-			if !stale {
-				filtered = append(filtered, prs[i])
-			}
-		}
-		prs = filtered
+		prs = filterStalePRs(prs)
 	}
 
 	// Sort PRs by most recently updated
@@ -1105,55 +1183,15 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 	// Split into incoming and outgoing
 	incoming, outgoing := categorizePRs(prs, username)
 
-	// Count blocking PRs - separate critical and non-critical
-	inBlocked := 0  // critical actions only
-	inAwaiting := 0 // non-critical actions
-	for i := range incoming {
-		if isCriticalBlocker(&incoming[i], username) {
-			inBlocked++
-		} else if isBlockingOnUser(&incoming[i], username) {
-			inAwaiting++
-		}
-	}
-
-	outBlocked := 0  // critical actions only
-	outAwaiting := 0 // non-critical actions
-	for i := range outgoing {
-		if isCriticalBlocker(&outgoing[i], username) {
-			outBlocked++
-		} else if isBlockingOnUser(&outgoing[i], username) {
-			outAwaiting++
-		}
-	}
+	// Count blocking PRs
+	inBlocked, inAwaiting := countBlockingPRs(incoming, username)
+	outBlocked, outAwaiting := countBlockingPRs(outgoing, username)
 
 	output.WriteString("\n")
 
 	// Incoming PRs with integrated header
 	if len(incoming) > 0 && (!blockingOnly || inBlocked > 0 || inAwaiting > 0) {
-		// Header with counts - proper singular/plural
-		prText := "PR"
-		if len(incoming) != 1 {
-			prText = "PRs"
-		}
-		output.WriteString(fmt.Sprintf("incoming - %d %s", len(incoming), prText))
-		if inBlocked > 0 {
-			output.WriteString(", ")
-			blockText := "blocked on YOU"
-			output.WriteString(lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#E5484D")). // Red for critical blocked count
-				Bold(true).
-				Render(fmt.Sprintf("%d %s", inBlocked, blockText)))
-		}
-		if inAwaiting > 0 {
-			output.WriteString(", ")
-			awaitText := "awaiting your input"
-			output.WriteString(lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#FFB224")). // Yellow for awaiting input
-				Bold(true).
-				Render(fmt.Sprintf("%d %s", inAwaiting, awaitText)))
-		}
-		output.WriteString(":\n")
-
+		output.WriteString(formatPRListHeader(len(incoming), inBlocked, inAwaiting, false))
 		for i := range incoming {
 			if blockingOnly && !isBlockingOnUser(&incoming[i], username) {
 				continue
@@ -1167,33 +1205,7 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, verbose, include
 		if len(incoming) > 0 {
 			output.WriteString("\n")
 		}
-
-		// Header with counts - gray color for distinction, proper singular/plural
-		prText := "PR"
-		if len(outgoing) != 1 {
-			prText = "PRs"
-		}
-		output.WriteString(lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#8B8B8B")). // Gray for outgoing header
-			Render(fmt.Sprintf("outgoing - %d %s", len(outgoing), prText)))
-		if outBlocked > 0 {
-			output.WriteString(", ")
-			blockText := "blocked on YOU"
-			output.WriteString(lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#E5484D")).
-				Bold(true).
-				Render(fmt.Sprintf("%d %s", outBlocked, blockText)))
-		}
-		if outAwaiting > 0 {
-			output.WriteString(", ")
-			awaitText := "awaiting your input"
-			output.WriteString(lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#FFB224")).
-				Bold(true).
-				Render(fmt.Sprintf("%d %s", outAwaiting, awaitText)))
-		}
-		output.WriteString(":\n")
-
+		output.WriteString(formatPRListHeader(len(outgoing), outBlocked, outAwaiting, true))
 		for i := range outgoing {
 			if blockingOnly && !isBlockingOnUser(&outgoing[i], username) {
 				continue
@@ -1220,6 +1232,76 @@ func terminalWidth() int {
 	return width
 }
 
+// appendNextActionKinds appends formatted next action kinds to the output.
+func appendNextActionKinds(output *strings.Builder, pr *PR, username string) {
+	if pr.TurnResponse == nil || pr.TurnResponse.Analysis.NextAction == nil {
+		return
+	}
+
+	var userActionKinds []string
+	var otherCriticalKinds []string
+	var userActionCritical bool
+	seen := make(map[string]bool)
+
+	// First, collect current user's actions
+	if userAction, hasUserAction := pr.TurnResponse.Analysis.NextAction[username]; hasUserAction {
+		kind := string(userAction.Kind)
+		if !seen[kind] {
+			userActionKinds = append(userActionKinds, kind)
+			seen[kind] = true
+			userActionCritical = userAction.Critical
+		}
+	}
+
+	// Then collect critical actions from other users (avoiding duplicates)
+	for user, action := range pr.TurnResponse.Analysis.NextAction {
+		if user != username && action.Critical {
+			kind := string(action.Kind)
+			if !seen[kind] {
+				otherCriticalKinds = append(otherCriticalKinds, kind)
+				seen[kind] = true
+			}
+		}
+	}
+
+	// Display actions if any exist
+	if len(userActionKinds) == 0 && len(otherCriticalKinds) == 0 {
+		return
+	}
+
+	// Dark grey emdash
+	output.WriteString(lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#6B6B6B")). // Dark grey
+		Render(" — "))
+
+	// Display user's actions first with appropriate color
+	if len(userActionKinds) > 0 {
+		actionText := strings.Join(userActionKinds, " ")
+		if userActionCritical {
+			// Red for critical user action
+			output.WriteString(lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#E5484D")).
+				Render(actionText))
+		} else {
+			// Yellow for non-critical user action
+			output.WriteString(lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#FFB224")).
+				Render(actionText))
+		}
+	}
+
+	// Display other critical actions in dark grey
+	if len(otherCriticalKinds) > 0 {
+		if len(userActionKinds) > 0 {
+			output.WriteString(" ") // Space between user and other actions
+		}
+		actionText := strings.Join(otherCriticalKinds, " ")
+		output.WriteString(lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#6B6B6B")).
+			Render(actionText))
+	}
+}
+
 func formatPR(pr *PR, username string) string {
 	var output strings.Builder
 
@@ -1230,19 +1312,20 @@ func formatPR(pr *PR, username string) string {
 	isBlocking := isBlockingOnUser(pr, username)
 	isCritical := isCriticalBlocker(pr, username)
 
-	if isCritical {
+	switch {
+	case isCritical:
 		// Red triangle for critical blocker
 		output.WriteString(lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#E5484D")). // Modern red
 			Bold(true).
 			Render("► "))
-	} else if isBlocking {
+	case isBlocking:
 		// Yellow bullet for regular next action
 		output.WriteString(lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FFB224")). // Yellow/amber
 			Bold(true).
 			Render("• "))
-	} else {
+	default:
 		output.WriteString("  ") // Just indent, no bullet for non-blocking
 	}
 
@@ -1291,68 +1374,7 @@ func formatPR(pr *PR, username string) string {
 	}
 
 	// Add NextAction kinds if available
-	if pr.TurnResponse != nil && pr.TurnResponse.Analysis.NextAction != nil {
-		var userActionKinds []string
-		var otherCriticalKinds []string
-		var userActionCritical bool
-		seen := make(map[string]bool)
-
-		// First, collect current user's actions
-		if userAction, hasUserAction := pr.TurnResponse.Analysis.NextAction[username]; hasUserAction {
-			kind := string(userAction.Kind)
-			if !seen[kind] {
-				userActionKinds = append(userActionKinds, kind)
-				seen[kind] = true
-				userActionCritical = userAction.Critical
-			}
-		}
-
-		// Then collect critical actions from other users (avoiding duplicates)
-		for user, action := range pr.TurnResponse.Analysis.NextAction {
-			if user != username && action.Critical {
-				kind := string(action.Kind)
-				if !seen[kind] {
-					otherCriticalKinds = append(otherCriticalKinds, kind)
-					seen[kind] = true
-				}
-			}
-		}
-
-		// Display actions if any exist
-		if len(userActionKinds) > 0 || len(otherCriticalKinds) > 0 {
-			// Dark grey emdash
-			output.WriteString(lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#6B6B6B")). // Dark grey
-				Render(" — "))
-
-			// Display user's actions first with appropriate color
-			if len(userActionKinds) > 0 {
-				actionText := strings.Join(userActionKinds, " ")
-				if userActionCritical {
-					// Red for critical user action
-					output.WriteString(lipgloss.NewStyle().
-						Foreground(lipgloss.Color("#E5484D")).
-						Render(actionText))
-				} else {
-					// Yellow for non-critical user action
-					output.WriteString(lipgloss.NewStyle().
-						Foreground(lipgloss.Color("#FFB224")).
-						Render(actionText))
-				}
-			}
-
-			// Display other critical actions in dark grey
-			if len(otherCriticalKinds) > 0 {
-				if len(userActionKinds) > 0 {
-					output.WriteString(" ") // Space between user and other actions
-				}
-				actionText := strings.Join(otherCriticalKinds, " ")
-				output.WriteString(lipgloss.NewStyle().
-					Foreground(lipgloss.Color("#6B6B6B")).
-					Render(actionText))
-			}
-		}
-	}
+	appendNextActionKinds(&output, pr, username)
 
 	output.WriteString("\n")
 	return output.String()
