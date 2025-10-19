@@ -1,7 +1,3 @@
-
-# BEGIN: lint-install .
-# http://github.com/codeGROOVE-dev/lint-install
-
 .PHONY: lint test build
 test:
 	go test -race ./...
@@ -10,6 +6,10 @@ build:
 	mkdir -p out
 	go build -o out/prs .
 
+# BEGIN: lint-install .
+# http://github.com/codeGROOVE-dev/lint-install
+
+.PHONY: lint
 lint: _lint
 
 LINT_ARCH := $(shell uname -m)
@@ -28,7 +28,7 @@ LINTERS :=
 FIXERS :=
 
 GOLANGCI_LINT_CONFIG := $(LINT_ROOT)/.golangci.yml
-GOLANGCI_LINT_VERSION ?= v2.4.0
+GOLANGCI_LINT_VERSION ?= v2.5.0
 GOLANGCI_LINT_BIN := $(LINT_ROOT)/out/linters/golangci-lint-$(GOLANGCI_LINT_VERSION)-$(LINT_ARCH)
 $(GOLANGCI_LINT_BIN):
 	mkdir -p $(LINT_ROOT)/out/linters
@@ -58,9 +58,19 @@ yamllint-lint: $(YAMLLINT_BIN)
 	PYTHONPATH=$(YAMLLINT_ROOT)/dist $(YAMLLINT_ROOT)/dist/bin/yamllint .
 
 .PHONY: _lint $(LINTERS)
-_lint: $(LINTERS)
+_lint:
+	@exit_code=0; \
+	for target in $(LINTERS); do \
+		$(MAKE) $$target || exit_code=1; \
+	done; \
+	exit $$exit_code
 
 .PHONY: fix $(FIXERS)
-fix: $(FIXERS)
+fix:
+	@exit_code=0; \
+	for target in $(FIXERS); do \
+		$(MAKE) $$target || exit_code=1; \
+	done; \
+	exit $$exit_code
 
 # END: lint-install .
