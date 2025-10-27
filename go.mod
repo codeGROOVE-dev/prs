@@ -3,11 +3,11 @@ module github.com/codeGROOVE-dev/prs
 go 1.25.1
 
 require (
-	github.com/avast/retry-go/v4 v4.6.1
 	github.com/charmbracelet/lipgloss v1.1.0
-	github.com/codeGROOVE-dev/sprinkler v0.0.0-20251001144140-ed20651ca4e9
-	github.com/codeGROOVE-dev/turnclient v0.0.0-20251001151440-a58eb9b17826
-	golang.org/x/term v0.35.0
+	github.com/codeGROOVE-dev/retry v1.2.0
+	github.com/codeGROOVE-dev/sprinkler v0.0.0-20251027122631-1d61827b70ca
+	github.com/codeGROOVE-dev/turnclient v0.0.0-20251022064427-5a712e1e10e6
+	golang.org/x/term v0.36.0
 )
 
 require (
@@ -16,17 +16,16 @@ require (
 	github.com/charmbracelet/x/ansi v0.10.2 // indirect
 	github.com/charmbracelet/x/cellbuf v0.0.13 // indirect
 	github.com/charmbracelet/x/term v0.2.1 // indirect
-	github.com/clipperhouse/uax29/v2 v2.2.0 // indirect
-	github.com/codeGROOVE-dev/prx v0.0.0-20251001143458-17e6b58fb46c // indirect
-	github.com/codeGROOVE-dev/retry v1.2.0 // indirect
+	github.com/clipperhouse/stringish v0.1.1 // indirect
+	github.com/clipperhouse/uax29/v2 v2.3.0 // indirect
+	github.com/codeGROOVE-dev/prx v0.0.0-20251027012315-7b273aabfc7d // indirect
 	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-runewidth v0.0.19 // indirect
 	github.com/muesli/termenv v0.16.0 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
-	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	golang.org/x/exp v0.0.0-20250911091902-df9299821621 // indirect
-	golang.org/x/net v0.44.0 // indirect
-	golang.org/x/sys v0.36.0 // indirect
+	golang.org/x/net v0.46.0 // indirect
+	golang.org/x/sys v0.37.0 // indirect
 )

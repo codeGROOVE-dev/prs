@@ -18,14 +18,15 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/avast/retry-go/v4"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/codeGROOVE-dev/retry"
 	"github.com/codeGROOVE-dev/sprinkler/pkg/client"
 	"github.com/codeGROOVE-dev/turnclient/pkg/turn"
 	"golang.org/x/term"
@@ -360,14 +361,12 @@ func gitHubToken(ctx context.Context) (string, error) {
 }
 
 func currentUser(ctx context.Context, token string, logger *log.Logger, httpClient *http.Client) (string, error) {
-	var username string
-
-	err := retry.Do(
-		func() error {
+	return retry.DoWithData(
+		func() (string, error) {
 			logger.Printf("Making API call to GET %s", apiUserEndpoint)
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiUserEndpoint, http.NoBody)
 			if err != nil {
-				return err
+				return "", err
 			}
 
 			req.Header.Set("Authorization", "token "+token)
@@ -377,30 +376,29 @@ func currentUser(ctx context.Context, token string, logger *log.Logger, httpClie
 			resp, err := httpClient.Do(req)
 			if err != nil {
 				logger.Printf("HTTP request failed: %v", err)
-				return err
+				return "", err
 			}
 			defer resp.Body.Close() //nolint:errcheck // Best effort close
 
 			if resp.StatusCode == http.StatusUnauthorized {
-				return errors.New("invalid GitHub token")
+				return "", errors.New("invalid GitHub token")
 			}
 			if resp.StatusCode != http.StatusOK {
 				body, err := io.ReadAll(resp.Body)
 				if err != nil {
-					return fmt.Errorf("failed to read response body: %w", err)
+					return "", fmt.Errorf("failed to read response body: %w", err)
 				}
-				return fmt.Errorf("GitHub API error (status %d): %s", resp.StatusCode, body)
+				return "", fmt.Errorf("GitHub API error (status %d): %s", resp.StatusCode, body)
 			}
 
 			var user struct {
 				Login string `json:"login"`
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
-				return err
+				return "", err
 			}
 
-			username = user.Login
-			return nil
+			return user.Login, nil
 		},
 		retry.Attempts(retryAttempts),
 		retry.Delay(retryDelay),
@@ -411,27 +409,18 @@ func currentUser(ctx context.Context, token string, logger *log.Logger, httpClie
 			logger.Printf("Retry attempt %d after error: %v", n+1, err)
 		}),
 	)
-
-	return username, err
 }
 
 func fetchPRsWithRetry(ctx context.Context, query *prQuery, logger *log.Logger, cls *clients) ([]PR, error) {
-	var prs []PR
-
-	err := retry.Do(
-		func() error {
+	return retry.DoWithData(
+		func() ([]PR, error) {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return nil, ctx.Err()
 			default:
 			}
 
-			result, err := fetchPRs(ctx, query, logger, cls)
-			if err != nil {
-				return err
-			}
-			prs = result
-			return nil
+			return fetchPRs(ctx, query, logger, cls)
 		},
 		retry.Context(ctx),
 		retry.Attempts(retryAttempts),
@@ -443,8 +432,6 @@ func fetchPRsWithRetry(ctx context.Context, query *prQuery, logger *log.Logger, 
 			logger.Printf("Retry attempt %d for fetchPRs: %v", n+1, err)
 		}),
 	)
-
-	return prs, err
 }
 
 func fetchPRs(ctx context.Context, query *prQuery, logger *log.Logger, cls *clients) ([]PR, error) {
@@ -493,7 +480,16 @@ func fetchPRs(ctx context.Context, query *prQuery, logger *log.Logger, cls *clie
 	prs = deduplicatePRs(prs)
 	logger.Printf("Found %d PRs (after deduplication)", len(prs))
 
-	enrichPRsParallel(ctx, query.token, prs, logger, cls.http, cls.turn, query.username, query.debug, query.noCache)
+	enrichCfg := &enrichConfig{
+		httpClient: cls.http,
+		turnClient: cls.turn,
+		logger:     logger,
+		token:      query.token,
+		username:   query.username,
+		debug:      query.debug,
+		noCache:    query.noCache,
+	}
+	enrichPRsParallel(ctx, prs, enrichCfg)
 	logger.Printf("INFO: Successfully enriched all %d PRs", len(prs))
 
 	// Filter out closed/merged PRs (can happen due to GitHub search lag or stale cache)
@@ -569,10 +565,6 @@ func parseSearchResponse(resp *http.Response) ([]PR, error) {
 }
 
 func deduplicatePRs(prs []PR) []PR {
-	if len(prs) <= 1 {
-		return prs
-	}
-
 	seen := make(map[string]PR, len(prs))
 
 	for i := range prs {
@@ -582,16 +574,14 @@ func deduplicatePRs(prs []PR) []PR {
 	}
 
 	result := make([]PR, 0, len(seen))
-	for k := range seen {
-		result = append(result, seen[k])
+	for u := range seen {
+		result = append(result, seen[u])
 	}
 
 	return result
 }
 
-func enrichPRsParallel(ctx context.Context, token string, prs []PR, logger *log.Logger,
-	httpClient *http.Client, turnClient *turn.Client, username string, debug bool, noCache bool,
-) {
+func enrichPRsParallel(ctx context.Context, prs []PR, cfg *enrichConfig) {
 	// Simple semaphore pattern - Rob Pike style
 	sem := make(chan struct{}, maxConcurrent)
 	var wg sync.WaitGroup
@@ -606,11 +596,11 @@ func enrichPRsParallel(ctx context.Context, token string, prs []PR, logger *log.
 			}()
 
 			// Ignore non-critical errors - let the app continue
-			if err := enrichPRData(ctx, pr, token, logger, httpClient, turnClient, username, debug, noCache); err != nil {
+			if err := enrichPRData(ctx, pr, cfg); err != nil {
 				if errors.Is(err, context.Canceled) {
 					return
 				}
-				logger.Printf("WARNING: Failed to enrich PR #%d: %v", pr.Number, err)
+				cfg.logger.Printf("WARNING: Failed to enrich PR #%d: %v", pr.Number, err)
 			}
 		})
 	}
@@ -669,92 +659,80 @@ func fetchPRDetails(ctx context.Context, pr *PR, token string, httpClient *http.
 	return nil
 }
 
-func enrichPRData(
-	ctx context.Context,
-	pr *PR,
-	token string,
-	logger *log.Logger,
-	httpClient *http.Client,
-	turnClient *turn.Client,
-	username string,
-	debug bool,
-	noCache bool,
-) error {
+func enrichPRData(ctx context.Context, pr *PR, cfg *enrichConfig) error {
 	start := time.Now()
 	defer func() {
-		if debug {
-			logger.Printf("Enriched PR #%d in %v", pr.Number, time.Since(start))
+		if cfg.debug {
+			cfg.logger.Printf("Enriched PR #%d in %v", pr.Number, time.Since(start))
 		}
 	}()
 
 	// Fetch individual PR data to get size information
-	if err := fetchPRDetails(ctx, pr, token, httpClient, logger, debug); err != nil {
-		logger.Printf("WARNING: Failed to fetch PR details for #%d: %v", pr.Number, err)
+	if err := fetchPRDetails(ctx, pr, cfg.token, cfg.httpClient, cfg.logger, cfg.debug); err != nil {
+		cfg.logger.Printf("WARNING: Failed to fetch PR details for #%d: %v", pr.Number, err)
 		// Continue without size info
 	}
 
 	// Enrich with turn server data if available
-	if turnClient == nil {
-		if debug {
-			logger.Printf("Turn client is nil, skipping turn enrichment for PR #%d", pr.Number)
+	if cfg.turnClient == nil {
+		if cfg.debug {
+			cfg.logger.Printf("Turn client is nil, skipping turn enrichment for PR #%d", pr.Number)
 		}
 		return nil
 	}
-	if debug {
-		logger.Printf("Calling enrichWithTurnData for PR #%d", pr.Number)
+	if cfg.debug {
+		cfg.logger.Printf("Calling enrichWithTurnData for PR #%d", pr.Number)
 	}
-	return enrichWithTurnData(ctx, pr, logger, turnClient, username, debug, noCache)
+	return enrichWithTurnData(ctx, pr, cfg)
 }
 
-func enrichWithTurnData(ctx context.Context, pr *PR, logger *log.Logger, turnClient *turn.Client, username string, debug bool, noCache bool) error {
-	if debug {
-		logger.Printf("enrichWithTurnData called for PR #%d, URL: %s", pr.Number, pr.HTMLURL)
+func enrichWithTurnData(ctx context.Context, pr *PR, cfg *enrichConfig) error {
+	if cfg.debug {
+		cfg.logger.Printf("enrichWithTurnData called for PR #%d, URL: %s", pr.Number, pr.HTMLURL)
 	}
 
 	// Validate PR URL before sending to turn server
 	if pr.HTMLURL == "" || !strings.HasPrefix(pr.HTMLURL, "https://github.com/") {
-		logger.Printf("WARNING: Invalid PR URL for turn enrichment: %s", pr.HTMLURL)
+		cfg.logger.Printf("WARNING: Invalid PR URL for turn enrichment: %s", pr.HTMLURL)
 		return nil
 	}
 
 	// Check cache first (unless noCache is enabled)
 	var cachePath string
-	if !noCache {
+	if !cfg.noCache {
 		cachePath = turnCachePath(pr.HTMLURL, pr.UpdatedAt)
-		if debug {
-			logger.Printf("Cache path for PR #%d: %s", pr.Number, cachePath)
+		if cfg.debug {
+			cfg.logger.Printf("Cache path for PR #%d: %s", pr.Number, cachePath)
 		}
 		if cached, found := loadTurnCache(cachePath); found {
-			if debug {
-				logger.Printf("INFO: Cache hit for PR #%d", pr.Number)
+			if cfg.debug {
+				cfg.logger.Printf("INFO: Cache hit for PR #%d", pr.Number)
 			}
 			pr.TurnResponse = cached
 			return nil
 		}
 
 		// Cache miss
-		if debug {
-			logger.Printf("INFO: Cache miss for PR #%d", pr.Number)
+		if cfg.debug {
+			cfg.logger.Printf("INFO: Cache miss for PR #%d", pr.Number)
 		}
-	} else if debug {
-		logger.Printf("INFO: Cache disabled (--no-cache) for PR #%d", pr.Number)
+	} else if cfg.debug {
+		cfg.logger.Printf("INFO: Cache disabled (--no-cache) for PR #%d", pr.Number)
 	}
 
-	return fetchAndCacheTurnData(ctx, pr, logger, turnClient, username, debug, cachePath, noCache)
+	return fetchAndCacheTurnData(ctx, pr, cachePath, cfg)
 }
 
-func fetchAndCacheTurnData(ctx context.Context, pr *PR, logger *log.Logger,
-	turnClient *turn.Client, username string, debug bool, cachePath string, noCache bool,
-) error {
+func fetchAndCacheTurnData(ctx context.Context, pr *PR, cachePath string, cfg *enrichConfig) error {
 	turnStart := time.Now()
-	if debug {
-		logger.Printf("Sending turnclient request for PR #%d: URL=%s, UpdatedAt=%s",
+	if cfg.debug {
+		cfg.logger.Printf("Sending turnclient request for PR #%d: URL=%s, UpdatedAt=%s",
 			pr.Number, pr.HTMLURL, pr.UpdatedAt.Format(time.RFC3339))
 	}
 
-	turnResponse, err := turnClient.Check(ctx, pr.HTMLURL, username, pr.UpdatedAt)
+	turnResponse, err := cfg.turnClient.Check(ctx, pr.HTMLURL, cfg.username, pr.UpdatedAt)
 	if err != nil {
-		logger.Printf("WARNING: Failed to get turn data for PR #%d: %v", pr.Number, err)
+		cfg.logger.Printf("WARNING: Failed to get turn data for PR #%d: %v", pr.Number, err)
 		return nil // Don't fail the entire enrichment if turn server is unavailable
 	}
 
@@ -763,30 +741,27 @@ func fetchAndCacheTurnData(ctx context.Context, pr *PR, logger *log.Logger,
 	}
 
 	pr.TurnResponse = turnResponse
-	if !noCache {
+	if !cfg.noCache {
 		saveTurnCache(cachePath, turnResponse)
 	}
 
-	if debug {
-		if err := logDebugTurnResponse(logger, pr.Number, turnResponse, time.Since(turnStart)); err != nil {
-			return err
-		}
+	if cfg.debug {
+		logDebugTurnResponse(cfg.logger, pr.Number, turnResponse, time.Since(turnStart))
 	}
 	return nil
 }
 
-func logDebugTurnResponse(logger *log.Logger, prNumber int, turnResponse *turn.CheckResponse, duration time.Duration) error {
+func logDebugTurnResponse(logger *log.Logger, prNumber int, turnResponse *turn.CheckResponse, duration time.Duration) {
 	logger.Printf("Turn server call for PR #%d took %v", prNumber, duration)
 	responseJSON, err := json.MarshalIndent(turnResponse, "", "  ")
 	if err != nil {
-		logger.Printf("ERROR: Failed to marshal turn response for PR #%d: %v", prNumber, err)
+		logger.Printf("WARNING: Failed to marshal turn response for PR #%d: %v", prNumber, err)
 		// Try to at least log some basic info
 		logger.Printf("Turn response for PR #%d: Analysis.Tags=%v, NextActions=%d",
 			prNumber, turnResponse.Analysis.Tags, len(turnResponse.Analysis.NextAction))
-		return fmt.Errorf("failed to marshal turn response: %w", err)
+		return
 	}
 	logger.Printf("Received turnclient response for PR #%d:\n%s", prNumber, string(responseJSON))
-	return nil
 }
 
 func isBlockingOnUser(pr *PR, username string) bool {
@@ -855,6 +830,17 @@ type clients struct {
 	turn *turn.Client
 }
 
+// enrichConfig holds configuration for PR enrichment.
+type enrichConfig struct {
+	httpClient *http.Client
+	turnClient *turn.Client
+	logger     *log.Logger
+	token      string
+	username   string
+	debug      bool
+	noCache    bool
+}
+
 // prQuery holds parameters for PR queries.
 type prQuery struct {
 	token    string
@@ -907,9 +893,8 @@ func runWatchMode(ctx context.Context, cfg *watchConfig) {
 	// Create refresh tracker to prevent duplicate API calls
 	refreshTracker := newPRRefreshTracker()
 
-	const updateChanSize = 10
 	// Channel to trigger display updates
-	updateChan := make(chan bool, updateChanSize)
+	updateChan := make(chan bool, 10)
 
 	// Initial display
 	displayCfg := &displayConfig{
@@ -1390,11 +1375,7 @@ func orgFromURL(urlStr string) string {
 }
 
 func sortPRsByUpdateTime(prs []PR) {
-	for i := 0; i < len(prs); i++ {
-		for j := i + 1; j < len(prs); j++ {
-			if prs[j].UpdatedAt.After(prs[i].UpdatedAt) {
-				prs[i], prs[j] = prs[j], prs[i]
-			}
-		}
-	}
+	sort.Slice(prs, func(i, j int) bool {
+		return prs[i].UpdatedAt.After(prs[j].UpdatedAt)
+	})
 }
