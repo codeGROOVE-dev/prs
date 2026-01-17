@@ -4,7 +4,6 @@ package main
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -17,7 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,6 +25,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/codeGROOVE-dev/fido/pkg/store/localfs"
 	"github.com/codeGROOVE-dev/retry"
 	"github.com/codeGROOVE-dev/sprinkler/pkg/client"
 	"github.com/codeGROOVE-dev/turnclient/pkg/turn"
@@ -70,28 +70,16 @@ type SearchResult struct {
 	Items []PR `json:"items"`
 }
 
-// cacheEntry represents a cached Turn API response.
-type cacheEntry struct {
-	Response  *turn.CheckResponse `json:"response"`
-	Timestamp time.Time           `json:"timestamp"`
-}
-
 // prRefreshTracker tracks the last refresh time for PRs to avoid duplicate API calls.
 type prRefreshTracker struct {
 	lastRefresh map[string]time.Time
 	mu          sync.RWMutex
 }
 
-func newPRRefreshTracker() *prRefreshTracker {
-	return &prRefreshTracker{
-		lastRefresh: make(map[string]time.Time),
-	}
-}
-
-func (t *prRefreshTracker) shouldRefresh(prURL string) bool {
-	t.mu.RLock()
-	lastTime, exists := t.lastRefresh[prURL]
-	t.mu.RUnlock()
+func (r *prRefreshTracker) shouldRefresh(prURL string) bool {
+	r.mu.RLock()
+	lastTime, exists := r.lastRefresh[prURL]
+	r.mu.RUnlock()
 
 	if !exists {
 		return true
@@ -100,10 +88,10 @@ func (t *prRefreshTracker) shouldRefresh(prURL string) bool {
 	return time.Since(lastTime) > time.Duration(prRefreshCooldownSecs)*time.Second
 }
 
-func (t *prRefreshTracker) markRefreshed(prURL string) {
-	t.mu.Lock()
-	t.lastRefresh[prURL] = time.Now()
-	t.mu.Unlock()
+func (r *prRefreshTracker) markRefreshed(prURL string) {
+	r.mu.Lock()
+	r.lastRefresh[prURL] = time.Now()
+	r.mu.Unlock()
 }
 
 const (
@@ -126,65 +114,18 @@ const (
 	minTokenLength        = 10                  // Minimum GitHub token length
 	maxIdleConnsPerHost   = 10                  // HTTP client setting
 	idleConnTimeout       = 90 * time.Second
-	minPRURLParts         = 6     // Minimum parts in PR URL
-	minOrgURLParts        = 4     // Minimum parts in org URL
-	repoPartIndex         = 4     // Index of repo in URL parts
-	prTypePartIndex       = 5     // Index of PR type in URL parts
-	numberPartIndex       = 6     // Index of PR number in URL parts
-	prURLParts            = 7     // Number of parts in a full PR URL
-	truncatedURLLength    = 80    // Max URL display length
-	defaultTerminalWidth  = 80    // Default terminal width if detection fails
-	titlePadding          = 5     // Space between title and URL
-	minTitleLength        = 20    // Minimum title display length
-	cacheFileMode         = 0o644 // File permissions for cache files
-	stalePRDays           = 90    // Days before a PR is considered stale
+	minPRURLParts         = 6  // Minimum parts in PR URL
+	minOrgURLParts        = 4  // Minimum parts in org URL
+	repoPartIndex         = 4  // Index of repo in URL parts
+	prTypePartIndex       = 5  // Index of PR type in URL parts
+	numberPartIndex       = 6  // Index of PR number in URL parts
+	prURLParts            = 7  // Number of parts in a full PR URL
+	truncatedURLLength    = 80 // Max URL display length
+	defaultTerminalWidth  = 80 // Default terminal width if detection fails
+	titlePadding          = 5  // Space between title and URL
+	minTitleLength        = 20 // Minimum title display length
+	stalePRDays           = 90 // Days before a PR is considered stale
 )
-
-// turnCache handles caching of Turn API responses.
-func turnCachePath(urlPath string, updatedAt time.Time) string {
-	dir, err := os.UserCacheDir()
-	if err != nil || dir == "" {
-		return "" // No cache if we can't find cache dir
-	}
-
-	// Simple hash for filename
-	h := sha256.Sum256([]byte(urlPath + updatedAt.Format(time.RFC3339)))
-	return filepath.Join(dir, "prs", "turn-cache", hex.EncodeToString(h[:8])+".json")
-}
-
-func loadTurnCache(path string) (*turn.CheckResponse, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, false
-	}
-
-	var entry cacheEntry
-	if json.Unmarshal(data, &entry) != nil {
-		return nil, false
-	}
-
-	// Check if expired
-	if time.Since(entry.Timestamp) > cacheTTL {
-		// Best effort removal of expired cache
-		os.Remove(path) //nolint:errcheck,gosec // Removal failures are acceptable
-		return nil, false
-	}
-
-	return entry.Response, true
-}
-
-func saveTurnCache(path string, response *turn.CheckResponse) {
-	if path == "" {
-		return
-	}
-
-	// Best effort cache write - failures are non-critical
-	os.MkdirAll(filepath.Dir(path), 0o755) //nolint:errcheck,gosec // Directory creation failures are acceptable
-	data, err := json.Marshal(cacheEntry{Response: response, Timestamp: time.Now()})
-	if err == nil {
-		os.WriteFile(path, data, cacheFileMode) //nolint:errcheck,gosec // Write failures are acceptable
-	}
-}
 
 func main() {
 	var (
@@ -267,6 +208,13 @@ func main() {
 		}
 	}
 
+	// Set up cache store
+	cache, err := localfs.New[string, *turn.CheckResponse]("prs-turn-cache", "")
+	if err != nil {
+		logger.Printf("WARNING: Failed to create cache store: %v", err)
+		cache = nil
+	}
+
 	// Handle interrupts gracefully
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -297,6 +245,7 @@ func main() {
 			logger:       logger,
 			httpClient:   httpClient,
 			turnClient:   turnClient,
+			cache:        cache,
 			debug:        *verbose,
 			org:          "",
 			includeStale: *includeStale,
@@ -314,8 +263,9 @@ func main() {
 			noCache:  *noCache,
 		}
 		cls := &clients{
-			http: httpClient,
-			turn: turnClient,
+			http:  httpClient,
+			turn:  turnClient,
+			cache: cache,
 		}
 		prs, err := fetchPRsWithRetry(ctx, query, logger, cls)
 		if err != nil {
@@ -483,6 +433,7 @@ func fetchPRs(ctx context.Context, query *prQuery, logger *log.Logger, cls *clie
 	enrichCfg := &enrichConfig{
 		httpClient: cls.http,
 		turnClient: cls.turn,
+		cache:      cls.cache,
 		logger:     logger,
 		token:      query.token,
 		username:   query.username,
@@ -697,33 +648,32 @@ func enrichWithTurnData(ctx context.Context, pr *PR, cfg *enrichConfig) error {
 		return nil
 	}
 
-	// Check cache first (unless noCache is enabled)
-	var cachePath string
-	if !cfg.noCache {
-		cachePath = turnCachePath(pr.HTMLURL, pr.UpdatedAt)
-		if cfg.debug {
-			cfg.logger.Printf("Cache path for PR #%d: %s", pr.Number, cachePath)
-		}
-		if cached, found := loadTurnCache(cachePath); found {
+	// Check cache first (unless noCache is enabled or cache is unavailable)
+	cacheKey := pr.HTMLURL + ":" + pr.UpdatedAt.Format(time.RFC3339)
+	if !cfg.noCache && cfg.cache != nil {
+		cached, _, found, err := cfg.cache.Get(ctx, cacheKey)
+		if err == nil && found {
 			if cfg.debug {
 				cfg.logger.Printf("INFO: Cache hit for PR #%d", pr.Number)
 			}
 			pr.TurnResponse = cached
 			return nil
 		}
-
-		// Cache miss
 		if cfg.debug {
 			cfg.logger.Printf("INFO: Cache miss for PR #%d", pr.Number)
 		}
 	} else if cfg.debug {
-		cfg.logger.Printf("INFO: Cache disabled (--no-cache) for PR #%d", pr.Number)
+		if cfg.noCache {
+			cfg.logger.Printf("INFO: Cache disabled (--no-cache) for PR #%d", pr.Number)
+		} else {
+			cfg.logger.Printf("INFO: Cache unavailable for PR #%d", pr.Number)
+		}
 	}
 
-	return fetchAndCacheTurnData(ctx, pr, cachePath, cfg)
+	return fetchAndCacheTurnData(ctx, pr, cacheKey, cfg)
 }
 
-func fetchAndCacheTurnData(ctx context.Context, pr *PR, cachePath string, cfg *enrichConfig) error {
+func fetchAndCacheTurnData(ctx context.Context, pr *PR, cacheKey string, cfg *enrichConfig) error {
 	turnStart := time.Now()
 	if cfg.debug {
 		cfg.logger.Printf("Sending turnclient request for PR #%d: URL=%s, UpdatedAt=%s",
@@ -733,7 +683,7 @@ func fetchAndCacheTurnData(ctx context.Context, pr *PR, cachePath string, cfg *e
 	turnResponse, err := cfg.turnClient.Check(ctx, pr.HTMLURL, cfg.username, pr.UpdatedAt)
 	if err != nil {
 		cfg.logger.Printf("WARNING: Failed to get turn data for PR #%d: %v", pr.Number, err)
-		return nil // Don't fail the entire enrichment if turn server is unavailable
+		return nil
 	}
 
 	if turnResponse == nil {
@@ -741,27 +691,25 @@ func fetchAndCacheTurnData(ctx context.Context, pr *PR, cachePath string, cfg *e
 	}
 
 	pr.TurnResponse = turnResponse
-	if !cfg.noCache {
-		saveTurnCache(cachePath, turnResponse)
+	if !cfg.noCache && cfg.cache != nil {
+		expiry := time.Now().Add(cacheTTL)
+		if err := cfg.cache.Set(ctx, cacheKey, turnResponse, expiry); err != nil && cfg.debug {
+			cfg.logger.Printf("WARNING: Failed to cache turn data for PR #%d: %v", pr.Number, err)
+		}
 	}
 
 	if cfg.debug {
-		logDebugTurnResponse(cfg.logger, pr.Number, turnResponse, time.Since(turnStart))
+		cfg.logger.Printf("Turn server call for PR #%d took %v", pr.Number, time.Since(turnStart))
+		responseJSON, err := json.MarshalIndent(turnResponse, "", "  ")
+		if err != nil {
+			cfg.logger.Printf("WARNING: Failed to marshal turn response for PR #%d: %v", pr.Number, err)
+			cfg.logger.Printf("Turn response for PR #%d: Analysis.Tags=%v, NextActions=%d",
+				pr.Number, turnResponse.Analysis.Tags, len(turnResponse.Analysis.NextAction))
+		} else {
+			cfg.logger.Printf("Received turnclient response for PR #%d:\n%s", pr.Number, string(responseJSON))
+		}
 	}
 	return nil
-}
-
-func logDebugTurnResponse(logger *log.Logger, prNumber int, turnResponse *turn.CheckResponse, duration time.Duration) {
-	logger.Printf("Turn server call for PR #%d took %v", prNumber, duration)
-	responseJSON, err := json.MarshalIndent(turnResponse, "", "  ")
-	if err != nil {
-		logger.Printf("WARNING: Failed to marshal turn response for PR #%d: %v", prNumber, err)
-		// Try to at least log some basic info
-		logger.Printf("Turn response for PR #%d: Analysis.Tags=%v, NextActions=%d",
-			prNumber, turnResponse.Analysis.Tags, len(turnResponse.Analysis.NextAction))
-		return
-	}
-	logger.Printf("Received turnclient response for PR #%d:\n%s", prNumber, string(responseJSON))
 }
 
 func isBlockingOnUser(pr *PR, username string) bool {
@@ -801,6 +749,15 @@ func categorizePRs(prs []PR, username string) (incoming, outgoing []PR) {
 	return incoming, outgoing
 }
 
+func wasBlockingBefore(pr *PR, previous []PR, username string) bool {
+	for i := range previous {
+		if previous[i].Number == pr.Number && previous[i].Repository.FullName == pr.Repository.FullName {
+			return isBlockingOnUser(&previous[i], username)
+		}
+	}
+	return false
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -808,32 +765,26 @@ func truncate(s string, n int) string {
 	return s[:n-3] + "..."
 }
 
-func wasBlockingBefore(pr *PR, previous []PR, username string) bool {
-	if found, exists := findPRInList(pr, previous); exists {
-		return isBlockingOnUser(&found, username)
+func orgFromURL(urlStr string) string {
+	parts := strings.Split(urlStr, "/")
+	if len(parts) >= minOrgURLParts && strings.Contains(urlStr, "github.com") {
+		return parts[3]
 	}
-	return false
-}
-
-func findPRInList(target *PR, prs []PR) (PR, bool) {
-	for i := range prs {
-		if prs[i].Number == target.Number && prs[i].Repository.FullName == target.Repository.FullName {
-			return prs[i], true
-		}
-	}
-	return PR{}, false
+	return ""
 }
 
 // clients holds HTTP and Turn clients.
 type clients struct {
-	http *http.Client
-	turn *turn.Client
+	http  *http.Client
+	turn  *turn.Client
+	cache *localfs.Store[string, *turn.CheckResponse]
 }
 
 // enrichConfig holds configuration for PR enrichment.
 type enrichConfig struct {
 	httpClient *http.Client
 	turnClient *turn.Client
+	cache      *localfs.Store[string, *turn.CheckResponse]
 	logger     *log.Logger
 	token      string
 	username   string
@@ -855,6 +806,7 @@ type displayConfig struct {
 	logger          *log.Logger
 	httpClient      *http.Client
 	turnClient      *turn.Client
+	cache           *localfs.Store[string, *turn.CheckResponse]
 	lastDisplayHash *string
 	token           string
 	username        string
@@ -870,6 +822,7 @@ type displayConfig struct {
 type watchConfig struct {
 	httpClient   *http.Client
 	turnClient   *turn.Client
+	cache        *localfs.Store[string, *turn.CheckResponse]
 	logger       *log.Logger
 	org          string
 	token        string
@@ -891,7 +844,9 @@ func runWatchMode(ctx context.Context, cfg *watchConfig) {
 	var lastDisplayHash string
 
 	// Create refresh tracker to prevent duplicate API calls
-	refreshTracker := newPRRefreshTracker()
+	refreshTracker := &prRefreshTracker{
+		lastRefresh: make(map[string]time.Time),
+	}
 
 	// Channel to trigger display updates
 	updateChan := make(chan bool, 10)
@@ -901,6 +856,7 @@ func runWatchMode(ctx context.Context, cfg *watchConfig) {
 		logger:          cfg.logger,
 		httpClient:      cfg.httpClient,
 		turnClient:      cfg.turnClient,
+		cache:           cfg.cache,
 		lastDisplayHash: &lastDisplayHash,
 		excludedOrgs:    cfg.excludedOrgs,
 		token:           cfg.token,
@@ -1017,8 +973,9 @@ func updateDisplay(ctx context.Context, cfg *displayConfig) error {
 		noCache:  cfg.noCache,
 	}
 	cls := &clients{
-		http: cfg.httpClient,
-		turn: cfg.turnClient,
+		http:  cfg.httpClient,
+		turn:  cfg.turnClient,
+		cache: cfg.cache,
 	}
 	prs, err := fetchPRsWithRetry(ctx, query, cfg.logger, cls)
 	if err != nil {
@@ -1051,15 +1008,8 @@ func filterExcludedOrgs(prs []PR, excludedOrgs []string) []PR {
 
 	filtered := make([]PR, 0, len(prs))
 	for i := range prs {
-		excluded := false
 		org := orgFromURL(prs[i].HTMLURL)
-		for _, exc := range excludedOrgs {
-			if org == exc {
-				excluded = true
-				break
-			}
-		}
-		if !excluded {
+		if !slices.Contains(excludedOrgs, org) {
 			filtered = append(filtered, prs[i])
 		}
 	}
@@ -1071,24 +1021,9 @@ func filterStalePRs(prs []PR) []PR {
 	filtered := make([]PR, 0, len(prs))
 	staleAge := stalePRDays * 24 * time.Hour
 	for i := range prs {
-		stale := false
-
-		// Check if PR is older than 90 days based on UpdatedAt
-		if time.Since(prs[i].UpdatedAt) > staleAge {
-			stale = true
-		}
-
-		// Also check TurnResponse tags if available
-		if !stale && prs[i].TurnResponse != nil {
-			for _, tag := range prs[i].TurnResponse.Analysis.Tags {
-				if tag == "stale" {
-					stale = true
-					break
-				}
-			}
-		}
-
-		if !stale {
+		isStale := time.Since(prs[i].UpdatedAt) > staleAge ||
+			(prs[i].TurnResponse != nil && slices.Contains(prs[i].TurnResponse.Analysis.Tags, "stale"))
+		if !isStale {
 			filtered = append(filtered, prs[i])
 		}
 	}
@@ -1163,7 +1098,9 @@ func generatePRDisplay(prs []PR, username string, blockingOnly, includeStale boo
 	}
 
 	// Sort PRs by most recently updated
-	sortPRsByUpdateTime(prs)
+	sort.Slice(prs, func(i, j int) bool {
+		return prs[i].UpdatedAt.After(prs[j].UpdatedAt)
+	})
 
 	// Split into incoming and outgoing
 	incoming, outgoing := categorizePRs(prs, username)
@@ -1324,10 +1261,7 @@ func formatPR(pr *PR, username string) string {
 	}
 
 	// Reserve space: bullet(2) + space(1) + url + some padding(5)
-	availableForTitle := termWidth - 2 - 1 - urlLength - titlePadding
-	if availableForTitle < minTitleLength {
-		availableForTitle = minTitleLength // Minimum title length
-	}
+	availableForTitle := max(termWidth-2-1-urlLength-titlePadding, minTitleLength)
 
 	// Title - truncated based on available space
 	title := pr.Title
@@ -1363,19 +1297,4 @@ func formatPR(pr *PR, username string) string {
 
 	output.WriteString("\n")
 	return output.String()
-}
-
-func orgFromURL(urlStr string) string {
-	// Extract org/owner from GitHub URL
-	parts := strings.Split(urlStr, "/")
-	if len(parts) >= minOrgURLParts && strings.Contains(urlStr, "github.com") {
-		return parts[3] // This is the org/owner
-	}
-	return ""
-}
-
-func sortPRsByUpdateTime(prs []PR) {
-	sort.Slice(prs, func(i, j int) bool {
-		return prs[i].UpdatedAt.After(prs[j].UpdatedAt)
-	})
 }

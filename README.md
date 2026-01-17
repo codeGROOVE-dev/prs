@@ -6,6 +6,12 @@ Designed to be easily used for embedded low-power displays, or your shell initia
 
 ## Install
 
+Via Homebrew:
+```bash
+brew install codegroove-dev/tap/review-goose-cli
+```
+
+Or via Go:
 ```bash
 go install github.com/codeGROOVE-dev/prs@latest
 ```
