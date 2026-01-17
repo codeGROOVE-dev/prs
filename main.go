@@ -559,9 +559,7 @@ func enrichPRsParallel(ctx context.Context, prs []PR, cfg *enrichConfig) {
 	wg.Wait()
 }
 
-func fetchPRDetails(ctx context.Context, pr *PR, token string, httpClient *http.Client, logger *log.Logger, debug bool) error {
-	// Extract repository info from PR URL
-	// URL format: https://github.com/owner/repo/pull/123
+func fetchPRDetails(ctx context.Context, pr *PR, cfg *enrichConfig) error {
 	parts := strings.Split(pr.HTMLURL, "/")
 	if len(parts) < minPRURLParts {
 		return fmt.Errorf("invalid PR URL format: %s", pr.HTMLURL)
@@ -569,20 +567,17 @@ func fetchPRDetails(ctx context.Context, pr *PR, token string, httpClient *http.
 	owner := parts[3]
 	repo := parts[repoPartIndex]
 
-	// Build API URL
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d", owner, repo, pr.Number)
 
-	// Create request
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, http.NoBody)
 	if err != nil {
 		return err
 	}
 
-	req.Header.Set("Authorization", "token "+token)
+	req.Header.Set("Authorization", "token "+cfg.token)
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 
-	// Make request
-	resp, err := httpClient.Do(req)
+	resp, err := cfg.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -592,19 +587,17 @@ func fetchPRDetails(ctx context.Context, pr *PR, token string, httpClient *http.
 		return fmt.Errorf("GitHub API returned status %d", resp.StatusCode)
 	}
 
-	// Parse response
 	var prDetails PR
 	if err := json.NewDecoder(resp.Body).Decode(&prDetails); err != nil {
 		return err
 	}
 
-	// Update PR with size information
 	pr.Additions = prDetails.Additions
 	pr.Deletions = prDetails.Deletions
 	pr.ChangedFiles = prDetails.ChangedFiles
 
-	if debug {
-		logger.Printf("Fetched PR #%d size: +%d/-%d files:%d", pr.Number, pr.Additions, pr.Deletions, pr.ChangedFiles)
+	if cfg.debug {
+		cfg.logger.Printf("Fetched PR #%d size: +%d/-%d files:%d", pr.Number, pr.Additions, pr.Deletions, pr.ChangedFiles)
 	}
 
 	return nil
@@ -619,7 +612,7 @@ func enrichPRData(ctx context.Context, pr *PR, cfg *enrichConfig) error {
 	}()
 
 	// Fetch individual PR data to get size information
-	if err := fetchPRDetails(ctx, pr, cfg.token, cfg.httpClient, cfg.logger, cfg.debug); err != nil {
+	if err := fetchPRDetails(ctx, pr, cfg); err != nil {
 		cfg.logger.Printf("WARNING: Failed to fetch PR details for #%d: %v", pr.Number, err)
 		// Continue without size info
 	}
@@ -630,9 +623,6 @@ func enrichPRData(ctx context.Context, pr *PR, cfg *enrichConfig) error {
 			cfg.logger.Printf("Turn client is nil, skipping turn enrichment for PR #%d", pr.Number)
 		}
 		return nil
-	}
-	if cfg.debug {
-		cfg.logger.Printf("Calling enrichWithTurnData for PR #%d", pr.Number)
 	}
 	return enrichWithTurnData(ctx, pr, cfg)
 }
@@ -663,11 +653,11 @@ func enrichWithTurnData(ctx context.Context, pr *PR, cfg *enrichConfig) error {
 			cfg.logger.Printf("INFO: Cache miss for PR #%d", pr.Number)
 		}
 	} else if cfg.debug {
+		msg := "Cache unavailable"
 		if cfg.noCache {
-			cfg.logger.Printf("INFO: Cache disabled (--no-cache) for PR #%d", pr.Number)
-		} else {
-			cfg.logger.Printf("INFO: Cache unavailable for PR #%d", pr.Number)
+			msg = "Cache disabled (--no-cache)"
 		}
+		cfg.logger.Printf("INFO: %s for PR #%d", msg, pr.Number)
 	}
 
 	return fetchAndCacheTurnData(ctx, pr, cacheKey, cfg)
