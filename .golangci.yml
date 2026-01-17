@@ -172,8 +172,6 @@ linters:
         - name: add-constant
           severity: warning
           disabled: true
-        - name: argument-limit
-          arguments: [9]
         - name: cognitive-complexity
           disabled: true # prefer maintidx
         - name: cyclomatic
@@ -187,6 +185,8 @@ linters:
         - name: max-public-structs
           arguments: [10]
         - name: flag-parameter # fixes are difficult
+          disabled: true
+        - name: bare-return
           disabled: true
 
     rowserrcheck:
